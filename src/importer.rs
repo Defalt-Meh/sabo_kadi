@@ -1,0 +1,767 @@
+//! XLSX importer.
+//!
+//! Invoked through the `import_xlsx` binary. There is deliberately **no HTTP
+//! upload path** — loading data is an offline, transactional operation.
+//!
+//! Guarantees:
+//!  * the whole import runs in a single transaction (all-or-nothing);
+//!  * it is idempotent on `source_records.doc_id` — re-importing the same file
+//!    updates rows in place instead of duplicating them;
+//!  * the original spreadsheet row is stored verbatim in `source_records.raw`;
+//!  * empty cells become SQL `NULL`; `"-"`-style placeholders become `NULL` in
+//!    the normalized columns while the raw row keeps them;
+//!  * persons/places are created and linked; coordinates, when present and
+//!    valid, produce a PostGIS point (via a DB trigger); places are still
+//!    created when coordinates are absent.
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use anyhow::{bail, Context, Result};
+use calamine::{open_workbook_auto, Data, Reader};
+use serde_json::{Map, Value};
+use sqlx::{PgConnection, PgPool};
+
+use crate::normalize::{clean_opt, extract_year_numeric, normalize_key, parse_coordinate};
+
+/// Advisory-lock key so two concurrent imports serialize instead of racing.
+const IMPORT_ADVISORY_LOCK: i64 = 0x4B_41_44_49; // "KADI"
+
+#[derive(Debug, Clone, Default)]
+pub struct ImportOptions {
+    /// Explicit worksheet name; defaults to the first sheet.
+    pub sheet: Option<String>,
+    /// Parse and validate everything, then roll back instead of committing.
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct ImportReport {
+    pub sheet: String,
+    pub rows_total: usize,
+    pub rows_imported: usize,
+    pub rows_skipped_empty: usize,
+    pub source_records_inserted: u64,
+    pub source_records_updated: u64,
+    pub appointments_inserted: u64,
+    pub appointments_updated: u64,
+    pub persons_created: u64,
+    pub places_created: u64,
+    pub place_coordinates_set: u64,
+    pub warnings: Vec<String>,
+    pub committed: bool,
+}
+
+impl ImportReport {
+    pub fn print_summary(&self) {
+        println!("\n─── import summary ───────────────────────────────");
+        println!("  sheet                     {}", self.sheet);
+        println!("  data rows                 {}", self.rows_total);
+        println!("  imported                  {}", self.rows_imported);
+        println!("  skipped (empty rows)      {}", self.rows_skipped_empty);
+        println!(
+            "  source_records            {} new / {} updated",
+            self.source_records_inserted, self.source_records_updated
+        );
+        println!(
+            "  appointments              {} new / {} updated",
+            self.appointments_inserted, self.appointments_updated
+        );
+        println!("  persons created           {}", self.persons_created);
+        println!("  places created            {}", self.places_created);
+        println!("  place coordinates set     {}", self.place_coordinates_set);
+        println!("  warnings                  {}", self.warnings.len());
+        for w in &self.warnings {
+            println!("    • {w}");
+        }
+        println!(
+            "  transaction               {}",
+            if self.committed {
+                "COMMITTED"
+            } else {
+                "ROLLED BACK"
+            }
+        );
+        println!("─────────────────────────────────────────────────");
+    }
+}
+
+/// Known logical columns and the header spellings that map to them.
+/// Header cells are matched after normalization (lower-case, non-alphanumerics
+/// collapsed to `_`).
+fn column_aliases() -> &'static [(&'static str, &'static [&'static str])] {
+    &[
+        (
+            "doc_id",
+            &[
+                "doc_id",
+                "docid",
+                "document_id",
+                "id",
+                "kayit_no",
+                "kayit_id",
+            ],
+        ),
+        ("degree", &["degree", "derece", "paye"]),
+        (
+            "position_type",
+            &[
+                "position_type",
+                "position",
+                "gorev",
+                "gorev_turu",
+                "atama_turu",
+            ],
+        ),
+        (
+            "period",
+            &["period", "period_type", "sure", "mudde", "mueddet"],
+        ),
+        ("salary", &["salary", "maas", "yevmiye", "akce"]),
+        ("old_salary", &["old_salary", "eski_maas", "onceki_maas"]),
+        ("asitane", &["asitane", "asitane_mi"]),
+        ("infisal", &["infisal", "infisal_mi"]),
+        (
+            "old_kadi",
+            &["old_kadi", "eski_kadi", "onceki_kadi", "selef"],
+        ),
+        ("new_kadi", &["new_kadi", "yeni_kadi", "atanan", "halef"]),
+        (
+            "old_place",
+            &[
+                "old_place",
+                "eski_yer",
+                "eski_kaza",
+                "onceki_yer",
+                "mahall_i_sabik",
+            ],
+        ),
+        (
+            "new_place",
+            &["new_place", "yeni_yer", "yeni_kaza", "mahall_i_lahik"],
+        ),
+        ("tarih", &["tarih", "date", "sene", "yil", "year"]),
+        (
+            "varak_no",
+            &["varak_no", "varak", "varak_numarasi", "vr_no", "folio"],
+        ),
+        ("region", &["region", "bolge", "eyalet", "vilayet"]),
+        ("certificate", &["certificate", "sicil", "belge", "berat"]),
+        (
+            "text",
+            &["text", "metin", "source_text", "kayit_metni", "hukum"],
+        ),
+        ("old_latitude", &["old_latitude", "old_lat", "eski_enlem"]),
+        (
+            "old_longitude",
+            &["old_longitude", "old_lng", "old_lon", "eski_boylam"],
+        ),
+        ("new_latitude", &["new_latitude", "new_lat", "yeni_enlem"]),
+        (
+            "new_longitude",
+            &["new_longitude", "new_lng", "new_lon", "yeni_boylam"],
+        ),
+    ]
+}
+
+fn normalize_header(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut prev_us = false;
+    for ch in raw.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_us = false;
+        } else if ch.is_alphanumeric() {
+            out.extend(ch.to_lowercase());
+            prev_us = false;
+        } else if !prev_us {
+            out.push('_');
+            prev_us = true;
+        }
+    }
+    out.trim_matches('_').to_string()
+}
+
+struct HeaderMap {
+    /// Raw header text per column index (for the verbatim `raw` JSON).
+    raw_headers: Vec<String>,
+    /// Logical column name -> column index.
+    logical: HashMap<&'static str, usize>,
+}
+
+impl HeaderMap {
+    fn build(header_cells: &[Data], warnings: &mut Vec<String>) -> Result<Self> {
+        if header_cells.is_empty() {
+            bail!("the worksheet has no header row");
+        }
+        let raw_headers: Vec<String> = header_cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let s = cell_to_string(c);
+                if s.trim().is_empty() {
+                    format!("column_{}", i + 1)
+                } else {
+                    s.trim().to_string()
+                }
+            })
+            .collect();
+
+        let normalized: Vec<String> = raw_headers.iter().map(|h| normalize_header(h)).collect();
+
+        let mut logical = HashMap::new();
+        for (logical_name, aliases) in column_aliases() {
+            if let Some(idx) = normalized
+                .iter()
+                .position(|h| aliases.contains(&h.as_str()))
+            {
+                logical.insert(*logical_name, idx);
+            }
+        }
+
+        if !logical.contains_key("doc_id") {
+            warnings.push(
+                "no `doc_id` column detected; per-row identifiers will be synthesized from the \
+                 sheet name and row number (re-import stays idempotent only if row order is stable)"
+                    .to_string(),
+            );
+        }
+        for required in ["old_place", "new_place"] {
+            if !logical.contains_key(required) {
+                warnings.push(format!(
+                    "no `{required}` column detected; movement endpoints will be sparse"
+                ));
+            }
+        }
+
+        Ok(Self {
+            raw_headers,
+            logical,
+        })
+    }
+
+    fn get<'a>(&self, row: &'a [Data], logical: &str) -> Option<&'a Data> {
+        let idx = *self.logical.get(logical)?;
+        row.get(idx)
+    }
+
+    /// Raw string for a logical column: trimmed, empty string when absent/blank.
+    fn raw_str(&self, row: &[Data], logical: &str) -> Option<String> {
+        let s = self
+            .get(row, logical)
+            .map(cell_to_string)
+            .unwrap_or_default();
+        let t = s.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    }
+
+    /// Normalized-nullable string: `None` for blank OR placeholder ("-", "yok"…).
+    fn clean_str(&self, row: &[Data], logical: &str) -> Option<String> {
+        self.raw_str(row, logical).and_then(|s| clean_opt(&s))
+    }
+}
+
+pub async fn import_path(pool: &PgPool, path: &Path, opts: &ImportOptions) -> Result<ImportReport> {
+    let mut workbook = open_workbook_auto(path)
+        .with_context(|| format!("could not open workbook `{}`", path.display()))?;
+
+    let sheet_name = match &opts.sheet {
+        Some(name) => {
+            if !workbook.sheet_names().iter().any(|s| s == name) {
+                bail!(
+                    "worksheet `{name}` not found; available: {}",
+                    workbook.sheet_names().join(", ")
+                );
+            }
+            name.clone()
+        }
+        None => workbook
+            .sheet_names()
+            .first()
+            .context("workbook contains no worksheets")?
+            .clone(),
+    };
+
+    let range = workbook
+        .worksheet_range(&sheet_name)
+        .with_context(|| format!("could not read worksheet `{sheet_name}`"))?;
+
+    let mut report = ImportReport {
+        sheet: sheet_name.clone(),
+        ..Default::default()
+    };
+
+    let mut rows = range.rows();
+    let header = match rows.next() {
+        Some(h) => h,
+        None => {
+            report.warnings.push("worksheet is empty".to_string());
+            return Ok(report);
+        }
+    };
+    let headers = HeaderMap::build(header, &mut report.warnings)?;
+
+    let mut tx = pool.begin().await.context("failed to open transaction")?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(IMPORT_ADVISORY_LOCK)
+        .execute(&mut *tx)
+        .await
+        .context("failed to take the import advisory lock")?;
+
+    let mut person_cache: HashMap<String, i64> = HashMap::new();
+    let mut place_cache: HashMap<String, PlaceCacheEntry> = HashMap::new();
+
+    for (offset, row) in rows.enumerate() {
+        let excel_row = offset + 2; // 1-based, plus header
+        if row.iter().all(|c| matches!(c, Data::Empty)) {
+            report.rows_skipped_empty += 1;
+            continue;
+        }
+        report.rows_total += 1;
+
+        import_row(
+            &mut tx,
+            &headers,
+            row,
+            excel_row,
+            &sheet_name,
+            &mut person_cache,
+            &mut place_cache,
+            &mut report,
+        )
+        .await
+        .with_context(|| format!("row {excel_row}: failed to import"))?;
+
+        report.rows_imported += 1;
+    }
+
+    if opts.dry_run {
+        tx.rollback().await.context("rollback failed")?;
+        report.committed = false;
+    } else {
+        tx.commit().await.context("commit failed")?;
+        report.committed = true;
+    }
+
+    Ok(report)
+}
+
+#[derive(Clone, Copy)]
+struct PlaceCacheEntry {
+    id: i64,
+    has_coords: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn import_row(
+    tx: &mut PgConnection,
+    headers: &HeaderMap,
+    row: &[Data],
+    excel_row: usize,
+    sheet_name: &str,
+    person_cache: &mut HashMap<String, i64>,
+    place_cache: &mut HashMap<String, PlaceCacheEntry>,
+    report: &mut ImportReport,
+) -> Result<()> {
+    // ---- verbatim raw row ----
+    let mut raw = Map::new();
+    for (i, cell) in row.iter().enumerate() {
+        let key = headers
+            .raw_headers
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| format!("column_{}", i + 1));
+        raw.insert(key, cell_to_json(cell));
+    }
+    let raw = Value::Object(raw);
+
+    // ---- source identity ----
+    let doc_id = match headers.clean_str(row, "doc_id") {
+        Some(id) => id,
+        None => {
+            let synthetic = format!("{sheet_name}::row-{excel_row}");
+            report.warnings.push(format!(
+                "row {excel_row}: missing doc_id, synthesized `{synthetic}`"
+            ));
+            synthetic
+        }
+    };
+
+    let varak_no = headers.clean_str(row, "varak_no");
+    let certificate = headers.clean_str(row, "certificate");
+    let source_text = headers.clean_str(row, "text");
+
+    let src: (i64, bool) = sqlx::query_as(
+        r#"
+        INSERT INTO source_records (doc_id, varak_no, certificate, source_text, raw)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (doc_id) DO UPDATE SET
+            varak_no    = EXCLUDED.varak_no,
+            certificate = EXCLUDED.certificate,
+            source_text = EXCLUDED.source_text,
+            raw         = EXCLUDED.raw
+        RETURNING id, (xmax = 0) AS inserted
+        "#,
+    )
+    .bind(doc_id.as_str())
+    .bind(varak_no.as_deref())
+    .bind(certificate.as_deref())
+    .bind(source_text.as_deref())
+    .bind(sqlx::types::Json(&raw))
+    .fetch_one(&mut *tx)
+    .await
+    .context("upsert source_records")?;
+    let (source_record_id, source_inserted) = src;
+    if source_inserted {
+        report.source_records_inserted += 1;
+    } else {
+        report.source_records_updated += 1;
+    }
+
+    // ---- persons ----
+    let raw_old_kadi = headers.raw_str(row, "old_kadi");
+    let raw_new_kadi = headers.raw_str(row, "new_kadi");
+    let old_person_id =
+        resolve_person(&mut *tx, raw_old_kadi.as_deref(), person_cache, report).await?;
+    let new_person_id =
+        resolve_person(&mut *tx, raw_new_kadi.as_deref(), person_cache, report).await?;
+
+    // ---- places (+ optional coordinates) ----
+    let raw_old_place = headers.raw_str(row, "old_place");
+    let raw_new_place = headers.raw_str(row, "new_place");
+    let (old_lat, old_lon) = read_coords(
+        headers,
+        row,
+        "old_latitude",
+        "old_longitude",
+        excel_row,
+        "origin",
+        report,
+    );
+    let (new_lat, new_lon) = read_coords(
+        headers,
+        row,
+        "new_latitude",
+        "new_longitude",
+        excel_row,
+        "destination",
+        report,
+    );
+
+    let origin_place_id = resolve_place(
+        &mut *tx,
+        raw_old_place.as_deref(),
+        old_lat,
+        old_lon,
+        place_cache,
+        report,
+    )
+    .await?;
+    let destination_place_id = resolve_place(
+        &mut *tx,
+        raw_new_place.as_deref(),
+        new_lat,
+        new_lon,
+        place_cache,
+        report,
+    )
+    .await?;
+
+    // ---- date (never guess the calendar) ----
+    let year_original = headers.raw_str(row, "tarih");
+    let year_numeric = year_original.as_deref().and_then(extract_year_numeric);
+
+    // ---- appointment event ----
+    let appt: (i64, bool) = sqlx::query_as(
+        r#"
+        INSERT INTO appointments (
+            source_record_id, old_person_id, new_person_id, origin_place_id, destination_place_id,
+            raw_old_kadi, raw_new_kadi, raw_old_place, raw_new_place,
+            year_original, year_numeric, calendar,
+            degree, position_type, period, salary, old_salary, asitane, infisal, region_raw
+        ) VALUES (
+            $1, $2, $3, $4, $5,
+            $6, $7, $8, $9,
+            $10, $11, 'unknown',
+            $12, $13, $14, $15, $16, $17, $18, $19
+        )
+        ON CONFLICT (source_record_id) DO UPDATE SET
+            old_person_id        = EXCLUDED.old_person_id,
+            new_person_id        = EXCLUDED.new_person_id,
+            origin_place_id      = EXCLUDED.origin_place_id,
+            destination_place_id = EXCLUDED.destination_place_id,
+            raw_old_kadi         = EXCLUDED.raw_old_kadi,
+            raw_new_kadi         = EXCLUDED.raw_new_kadi,
+            raw_old_place        = EXCLUDED.raw_old_place,
+            raw_new_place        = EXCLUDED.raw_new_place,
+            year_original        = EXCLUDED.year_original,
+            year_numeric         = EXCLUDED.year_numeric,
+            degree               = EXCLUDED.degree,
+            position_type        = EXCLUDED.position_type,
+            period               = EXCLUDED.period,
+            salary               = EXCLUDED.salary,
+            old_salary           = EXCLUDED.old_salary,
+            asitane              = EXCLUDED.asitane,
+            infisal              = EXCLUDED.infisal,
+            region_raw           = EXCLUDED.region_raw
+        RETURNING id, (xmax = 0) AS inserted
+        "#,
+    )
+    .bind(source_record_id)
+    .bind(old_person_id)
+    .bind(new_person_id)
+    .bind(origin_place_id)
+    .bind(destination_place_id)
+    .bind(raw_old_kadi.as_deref())
+    .bind(raw_new_kadi.as_deref())
+    .bind(raw_old_place.as_deref())
+    .bind(raw_new_place.as_deref())
+    .bind(year_original.as_deref())
+    .bind(year_numeric)
+    .bind(headers.clean_str(row, "degree"))
+    .bind(headers.clean_str(row, "position_type"))
+    .bind(headers.clean_str(row, "period"))
+    .bind(headers.clean_str(row, "salary"))
+    .bind(headers.clean_str(row, "old_salary"))
+    .bind(headers.clean_str(row, "asitane"))
+    .bind(headers.clean_str(row, "infisal"))
+    .bind(headers.clean_str(row, "region"))
+    .fetch_one(&mut *tx)
+    .await
+    .context("upsert appointments")?;
+    if appt.1 {
+        report.appointments_inserted += 1;
+    } else {
+        report.appointments_updated += 1;
+    }
+
+    Ok(())
+}
+
+fn read_coords(
+    headers: &HeaderMap,
+    row: &[Data],
+    lat_col: &str,
+    lon_col: &str,
+    excel_row: usize,
+    label: &str,
+    report: &mut ImportReport,
+) -> (Option<f64>, Option<f64>) {
+    let lat_raw = headers.raw_str(row, lat_col);
+    let lon_raw = headers.raw_str(row, lon_col);
+    if lat_raw.is_none() && lon_raw.is_none() {
+        return (None, None);
+    }
+    let lat = lat_raw.as_deref().and_then(parse_coordinate);
+    let lon = lon_raw.as_deref().and_then(parse_coordinate);
+
+    match (lat, lon) {
+        (Some(la), Some(lo)) if (-90.0..=90.0).contains(&la) && (-180.0..=180.0).contains(&lo) => {
+            (Some(la), Some(lo))
+        }
+        _ => {
+            report.warnings.push(format!(
+                "row {excel_row}: ignoring invalid {label} coordinates (lat={:?}, lon={:?})",
+                lat_raw, lon_raw
+            ));
+            (None, None)
+        }
+    }
+}
+
+async fn resolve_person(
+    tx: &mut PgConnection,
+    raw: Option<&str>,
+    cache: &mut HashMap<String, i64>,
+    report: &mut ImportReport,
+) -> Result<Option<i64>> {
+    let Some(raw) = raw else { return Ok(None) };
+    let Some(norm) = normalize_key(raw) else {
+        return Ok(None);
+    };
+    if let Some(id) = cache.get(&norm) {
+        return Ok(Some(*id));
+    }
+
+    let (id, created): (i64, bool) = sqlx::query_as(
+        r#"
+        WITH ins AS (
+            INSERT INTO persons (canonical_name, normalized_name)
+            VALUES ($1, $2)
+            ON CONFLICT (normalized_name) DO NOTHING
+            RETURNING id
+        )
+        SELECT id, true  FROM ins
+        UNION ALL
+        SELECT id, false FROM persons
+         WHERE normalized_name = $2 AND NOT EXISTS (SELECT 1 FROM ins)
+        "#,
+    )
+    .bind(raw.trim())
+    .bind(norm.as_str())
+    .fetch_one(&mut *tx)
+    .await
+    .context("resolve person")?;
+
+    if created {
+        report.persons_created += 1;
+    }
+    cache.insert(norm, id);
+    Ok(Some(id))
+}
+
+async fn resolve_place(
+    tx: &mut PgConnection,
+    raw: Option<&str>,
+    lat: Option<f64>,
+    lon: Option<f64>,
+    cache: &mut HashMap<String, PlaceCacheEntry>,
+    report: &mut ImportReport,
+) -> Result<Option<i64>> {
+    let Some(raw) = raw else { return Ok(None) };
+    let Some(norm) = normalize_key(raw) else {
+        return Ok(None);
+    };
+    let has_new_coords = lat.is_some() && lon.is_some();
+
+    if let Some(entry) = cache.get(&norm).copied() {
+        if has_new_coords && !entry.has_coords {
+            let filled = fill_place_coords(&mut *tx, entry.id, lat, lon).await?;
+            if filled {
+                report.place_coordinates_set += 1;
+                cache.insert(
+                    norm,
+                    PlaceCacheEntry {
+                        id: entry.id,
+                        has_coords: true,
+                    },
+                );
+            }
+        }
+        return Ok(Some(entry.id));
+    }
+
+    let (id, created): (i64, bool) = sqlx::query_as(
+        r#"
+        WITH ins AS (
+            INSERT INTO places (canonical_name, normalized_name, latitude, longitude)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (normalized_name) DO NOTHING
+            RETURNING id
+        )
+        SELECT id, true  FROM ins
+        UNION ALL
+        SELECT id, false FROM places
+         WHERE normalized_name = $2 AND NOT EXISTS (SELECT 1 FROM ins)
+        "#,
+    )
+    .bind(raw.trim())
+    .bind(norm.as_str())
+    .bind(lat)
+    .bind(lon)
+    .fetch_one(&mut *tx)
+    .await
+    .context("resolve place")?;
+
+    let mut has_coords = created && has_new_coords;
+    if created {
+        report.places_created += 1;
+        if has_new_coords {
+            report.place_coordinates_set += 1;
+        }
+    } else if has_new_coords {
+        let filled = fill_place_coords(&mut *tx, id, lat, lon).await?;
+        if filled {
+            report.place_coordinates_set += 1;
+            has_coords = true;
+        }
+    }
+
+    // Record the name as attested by this source (minimal place_names row;
+    // researcher-curated history with validity ranges is added later).
+    sqlx::query(
+        "INSERT INTO place_names (place_id, name, normalized_name, calendar) \
+         VALUES ($1, $2, $3, 'unknown') ON CONFLICT DO NOTHING",
+    )
+    .bind(id)
+    .bind(raw.trim())
+    .bind(norm.as_str())
+    .execute(&mut *tx)
+    .await
+    .context("record attested place name")?;
+
+    cache.insert(norm, PlaceCacheEntry { id, has_coords });
+    Ok(Some(id))
+}
+
+/// Fill coordinates only when the place currently has none. Existing coordinates
+/// are never overwritten silently. Returns whether a row was updated.
+async fn fill_place_coords(
+    tx: &mut PgConnection,
+    id: i64,
+    lat: Option<f64>,
+    lon: Option<f64>,
+) -> Result<bool> {
+    let updated = sqlx::query_scalar::<_, i64>(
+        "UPDATE places SET latitude = $2, longitude = $3 \
+         WHERE id = $1 AND latitude IS NULL AND longitude IS NULL \
+         RETURNING id",
+    )
+    .bind(id)
+    .bind(lat)
+    .bind(lon)
+    .fetch_optional(&mut *tx)
+    .await
+    .context("fill place coordinates")?;
+    Ok(updated.is_some())
+}
+
+// ---------------------------------------------------------------------------
+// Cell conversions
+// ---------------------------------------------------------------------------
+
+fn cell_to_string(cell: &Data) -> String {
+    match cell {
+        Data::Empty => String::new(),
+        Data::String(s) => s.clone(),
+        Data::Int(i) => i.to_string(),
+        Data::Float(f) => format_float(*f),
+        Data::Bool(b) => b.to_string(),
+        Data::DateTime(dt) => dt.to_string(),
+        Data::DateTimeIso(s) | Data::DurationIso(s) => s.clone(),
+        Data::Error(e) => format!("#ERROR({e:?})"),
+    }
+}
+
+fn cell_to_json(cell: &Data) -> Value {
+    match cell {
+        Data::Empty => Value::Null,
+        Data::String(s) => Value::String(s.clone()),
+        Data::Int(i) => Value::Number((*i).into()),
+        Data::Float(f) => {
+            if f.fract() == 0.0 && f.abs() < 9_007_199_254_740_992.0 {
+                Value::Number((*f as i64).into())
+            } else {
+                serde_json::Number::from_f64(*f)
+                    .map(Value::Number)
+                    .unwrap_or(Value::Null)
+            }
+        }
+        Data::Bool(b) => Value::Bool(*b),
+        Data::DateTime(dt) => Value::String(dt.to_string()),
+        Data::DateTimeIso(s) | Data::DurationIso(s) => Value::String(s.clone()),
+        Data::Error(e) => Value::String(format!("#ERROR({e:?})")),
+    }
+}
+
+fn format_float(f: f64) -> String {
+    if f.fract() == 0.0 && f.abs() < 9_007_199_254_740_992.0 {
+        format!("{}", f as i64)
+    } else {
+        format!("{f}")
+    }
+}

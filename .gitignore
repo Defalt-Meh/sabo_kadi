@@ -1,0 +1,19 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Local environment
+/.env
+/.env.*
+!/.env.example
+
+# Local throwaway PostgreSQL cluster (see README)
+/.pgdata
+
+# Imported / generated data
+/data/*
+!/data/.gitkeep
+!/data/build/.gitkeep
+
+# Editor / OS
+.DS_Store

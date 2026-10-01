@@ -1,0 +1,58 @@
+[package]
+name = "kadi-atlas"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+license = "MIT"
+description = "Read-only research API for a historical corpus of Ottoman kadı (judge) appointments"
+publish = false
+
+[lib]
+name = "kadi_atlas"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kadi-atlas"
+path = "src/main.rs"
+
+[[bin]]
+name = "import_xlsx"
+path = "src/bin/import_xlsx.rs"
+
+[dependencies]
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "signal", "net"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "set-header", "cors", "catch-panic", "timeout", "request-id", "fs"] }
+http = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "macros",
+    "migrate",
+    "json",
+    "chrono",
+] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+calamine = "0.36"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+thiserror = "2"
+anyhow = "1"
+dotenvy = "0.15"
+serde_urlencoded = "0.7"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+rust_xlsxwriter = "0.89"
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+panic = "unwind"

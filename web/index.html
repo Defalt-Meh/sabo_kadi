@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="tr" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#ffffff">
+  <!-- Leave empty to use the same origin; set to e.g. https://api.example.org/api/v1 -->
+  <meta name="kadi-api-base" content="">
+
+  <meta
+    name="description"
+    content="Osmanlı kadı atamalarını zaman, mekân ve kaynaklar üzerinden incelemek için tarihsel araştırma platformu."
+    data-i18n-content="meta.description"
+  >
+
+  <title data-i18n="meta.title">Kadı Atlası · Boğaziçi Üniversitesi</title>
+
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,500;8..60,600&display=swap">
+  <link rel="stylesheet" href="app.css">
+
+  <script defer src="js/theme.js"></script>
+  <script type="module" src="app.js"></script>
+</head>
+
+<body>
+  <a class="skip-link" href="#main-content" data-i18n="accessibility.skip">İçeriğe geç</a>
+
+  <!-- History was not normalized. Neither are we. -->
+  <header class="topbar">
+    <a class="brand" href="./" aria-label="Kadı Atlası ana sayfa" data-i18n-aria-label="brand.home">
+      <span class="brand-mark" aria-hidden="true">BÜ</span>
+      <span class="brand-copy">
+        <strong data-i18n="brand.name">Kadı Atlası</strong>
+        <span data-i18n="brand.university">Boğaziçi Üniversitesi</span>
+      </span>
+    </a>
+
+    <nav class="topnav" aria-label="Ana menü" data-i18n-aria-label="nav.main">
+      <button class="nav-item is-active" type="button" data-view="map" aria-current="page" data-i18n="nav.map">Harita</button>
+      <button class="nav-item" type="button" data-view="sources" data-i18n="nav.sources">Kaynaklar</button>
+      <button class="nav-item" type="button" data-action="about" data-i18n="nav.about">Yöntem</button>
+    </nav>
+
+    <div class="top-actions">
+      <div id="dataset-status" class="dataset-status" data-status="loading" aria-live="polite">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="dataset-status-label" data-i18n="status.loading">Veri yükleniyor</span>
+      </div>
+
+      <button id="language-toggle" class="icon-button" type="button" aria-label="Switch to English" title="English">
+        <span id="language-toggle-label" class="icon-button-text" aria-hidden="true">EN</span>
+      </button>
+
+      <button
+        id="theme-toggle"
+        class="icon-button"
+        type="button"
+        aria-label="Temayı değiştir"
+        title="Temayı değiştir"
+        data-i18n-aria-label="theme.toggle"
+        data-i18n-title="theme.toggle"
+      >
+        <svg class="icon-moon" aria-hidden="true" viewBox="0 0 24 24" width="18" height="18">
+          <path d="M12 3a9 9 0 1 0 9 9c0-.48-.04-.95-.11-1.41A7 7 0 0 1 12 3Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <svg class="icon-sun" aria-hidden="true" viewBox="0 0 24 24" width="18" height="18">
+          <circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="1.7"/>
+          <path d="M12 2.5v2M12 19.5v2M4.6 4.6 6 6M18 18l1.4 1.4M2.5 12h2M19.5 12h2M4.6 19.4 6 18M18 6l1.4-1.4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <main id="main-content" class="workspace">
+    <!-- 70k rows are not a user interface. -->
+    <aside class="sidebar" aria-label="Araştırma filtreleri" data-i18n-aria-label="filters.aria">
+      <div class="sidebar-scroll">
+        <section class="panel-section">
+          <div class="section-heading">
+            <div>
+              <span class="eyebrow" data-i18n="search.eyebrow">Ara</span>
+              <h2 data-i18n="search.person">Kadı</h2>
+            </div>
+            <button id="clear-persons" class="text-button" type="button" hidden data-i18n="actions.clearAll">Tümünü kaldır</button>
+          </div>
+
+          <div class="combobox">
+            <div class="search-field">
+              <svg class="field-icon" aria-hidden="true" viewBox="0 0 24 24" width="16" height="16">
+                <circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="1.6"/>
+                <path d="m16 16 4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+              </svg>
+              <label class="sr-only" for="person-search" data-i18n="search.personLabel">Kadı adı ara</label>
+              <input
+                id="person-search"
+                class="input search-input"
+                type="search"
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="İsim ara…"
+                data-i18n-placeholder="search.personPlaceholder"
+                role="combobox"
+                aria-autocomplete="list"
+                aria-expanded="false"
+                aria-controls="person-results"
+              >
+              <kbd class="field-hint" aria-hidden="true">/</kbd>
+            </div>
+            <div
+              id="person-results"
+              class="search-results"
+              role="listbox"
+              aria-label="Kadı arama sonuçları"
+              data-i18n-aria-label="search.personResults"
+              hidden
+            ></div>
+          </div>
+
+          <p id="person-hint" class="field-note" data-i18n="search.personHint">
+            Birden fazla kadı seçerek güzergâhlarını karşılaştırabilirsiniz.
+          </p>
+
+          <ul id="person-chips" class="person-chips" aria-label="Seçili kadılar" data-i18n-aria-label="persons.selected"></ul>
+        </section>
+
+        <section class="panel-section">
+          <div class="section-heading">
+            <div>
+              <span class="eyebrow" data-i18n="time.eyebrow">Zaman</span>
+              <h2 data-i18n="time.range">Tarih aralığı</h2>
+            </div>
+          </div>
+
+          <div class="year-fields">
+            <label class="field-group" for="year-from">
+              <span data-i18n="time.start">Başlangıç</span>
+              <input id="year-from" class="input" type="number" inputmode="numeric" step="1" placeholder="—" aria-describedby="year-error">
+            </label>
+            <span class="year-separator" aria-hidden="true">–</span>
+            <label class="field-group" for="year-to">
+              <span data-i18n="time.end">Bitiş</span>
+              <input id="year-to" class="input" type="number" inputmode="numeric" step="1" placeholder="—" aria-describedby="year-error">
+            </label>
+          </div>
+
+          <p id="year-error" class="field-error" role="alert" hidden></p>
+
+          <div class="timeline-control" aria-hidden="true">
+            <div class="timeline-track">
+              <div id="timeline-range" class="timeline-range"></div>
+            </div>
+            <div class="timeline-labels">
+              <span id="timeline-min">—</span>
+              <span id="timeline-max">—</span>
+            </div>
+          </div>
+
+          <p class="field-note" data-i18n="time.note">
+            Yıllar kaynak metinden çıkarılmış yaklaşık değerlerdir; takvim belirtilmemiştir.
+          </p>
+        </section>
+
+        <section class="panel-section">
+          <div class="section-heading">
+            <div>
+              <span class="eyebrow" data-i18n="appointments.eyebrow">Atama</span>
+              <h2 data-i18n="filters.title">Filtreler</h2>
+            </div>
+          </div>
+
+          <label class="field-group" for="degree-filter">
+            <span data-i18n="filters.degree">Derece</span>
+            <select id="degree-filter" class="input select-input">
+              <option value="" data-i18n="common.all">Tümü</option>
+            </select>
+          </label>
+
+          <label class="field-group" for="position-filter">
+            <span data-i18n="filters.positionType">Atama türü</span>
+            <select id="position-filter" class="input select-input">
+              <option value="" data-i18n="common.all">Tümü</option>
+            </select>
+          </label>
+
+          <div class="field-group">
+            <label for="place-search"><span data-i18n="filters.place">Yer</span></label>
+            <div class="combobox">
+              <input
+                id="place-search"
+                class="input"
+                type="search"
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="Yer adı ara…"
+                data-i18n-placeholder="search.placePlaceholder"
+                role="combobox"
+                aria-autocomplete="list"
+                aria-expanded="false"
+                aria-controls="place-results"
+              >
+              <div
+                id="place-results"
+                class="search-results"
+                role="listbox"
+                aria-label="Yer arama sonuçları"
+                data-i18n-aria-label="search.placeResults"
+                hidden
+              ></div>
+            </div>
+            <div id="place-filter" class="filter-chip" hidden>
+              <span id="place-filter-name"></span>
+              <button id="place-filter-clear" type="button" class="chip-remove" aria-label="Yer filtresini kaldır" data-i18n-aria-label="filters.removePlace">×</button>
+            </div>
+          </div>
+
+          <button id="reset-filters" class="secondary-button" type="button" data-i18n="actions.resetFilters">Filtreleri sıfırla</button>
+        </section>
+
+        <section class="panel-section metrics-section">
+          <span class="eyebrow" data-i18n="dataset.eyebrow">Veri kümesi</span>
+          <dl class="metrics">
+            <div><dt data-i18n="dataset.records">Kayıt</dt><dd id="metric-records">—</dd></div>
+            <div><dt data-i18n="dataset.persons">Kadı</dt><dd id="metric-persons">—</dd></div>
+            <div><dt data-i18n="dataset.places">Yer</dt><dd id="metric-places">—</dd></div>
+            <div><dt data-i18n="dataset.geocoded">Koordinatlı yer</dt><dd id="metric-geocoded">—</dd></div>
+          </dl>
+        </section>
+      </div>
+    </aside>
+
+    <section class="main-view">
+      <!-- Map view -->
+      <div id="map-view" class="view map-view">
+        <div class="view-toolbar">
+          <div class="view-heading">
+            <span id="map-eyebrow" class="eyebrow" data-i18n="map.eyebrow">Harita görünümü</span>
+            <div class="view-title-row">
+              <h1 id="map-title" data-i18n="map.title">Atama hareketleri</h1>
+              <span id="result-count" class="result-count"></span>
+            </div>
+            <p id="map-subtitle" data-i18n="map.subtitle">Koordinatı bulunan kayıtlar zaman ve mekân içinde gösterilir.</p>
+          </div>
+
+          <div class="view-controls">
+            <div class="segmented-control" role="group" aria-label="Harita görünümü" data-i18n-aria-label="map.viewMode">
+              <button class="segment is-active" type="button" data-map-mode="flows" aria-pressed="true" data-i18n="map.flows">Akışlar</button>
+              <button class="segment" type="button" data-map-mode="points" aria-pressed="false" data-i18n="map.places">Yerler</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="map-stage">
+          <div id="map" class="map" role="application" aria-roledescription="harita" aria-label="Tarihsel kadı atama haritası" data-i18n-aria-label="map.aria" tabindex="0"></div>
+
+          <div class="map-zoom" role="group" aria-label="Yakınlaştırma" data-i18n-aria-label="map.zoom">
+            <button id="zoom-in" class="map-tool" type="button" aria-label="Yakınlaştır" title="Yakınlaştır" data-i18n-aria-label="map.zoomIn" data-i18n-title="map.zoomIn">
+              <svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+            </button>
+            <button id="zoom-out" class="map-tool" type="button" aria-label="Uzaklaştır" title="Uzaklaştır" data-i18n-aria-label="map.zoomOut" data-i18n-title="map.zoomOut">
+              <svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16"><path d="M5 12h14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+            </button>
+            <button id="fit-map" class="map-tool" type="button" aria-label="Haritayı verilere sığdır" title="Haritayı verilere sığdır" data-i18n-aria-label="map.fit" data-i18n-title="map.fit">
+              <svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+          </div>
+
+          <div id="map-loading" class="map-loading" hidden>
+            <span class="loading-indicator" aria-hidden="true"></span>
+            <span data-i18n="map.loading">Harita hazırlanıyor</span>
+          </div>
+
+          <div id="map-empty" class="empty-state" role="status" hidden>
+            <div class="empty-symbol" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="22" height="22"><path d="M9 4 3 6v14l6-2 6 2 6-2V4l-6 2-6-2Zm0 0v14m6-12v14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+            </div>
+            <strong id="map-empty-title"></strong>
+            <span id="map-empty-text"></span>
+            <button id="map-retry" class="secondary-button compact" type="button" hidden data-i18n="actions.retry">Yeniden dene</button>
+          </div>
+
+          <div id="map-legend" class="map-legend" aria-label="Harita açıklaması" data-i18n-aria-label="map.legend"></div>
+        </div>
+
+        <div class="timebar">
+          <button id="timeline-play" class="timeline-play" type="button" aria-label="Zaman akışını oynat" title="Oynat" data-i18n-aria-label="timeline.play" data-i18n-title="timeline.playShort">
+            <svg class="icon-play" aria-hidden="true" viewBox="0 0 24 24" width="15" height="15"><path d="m9 7 8 5-8 5V7Z" fill="currentColor"/></svg>
+            <svg class="icon-pause" aria-hidden="true" viewBox="0 0 24 24" width="15" height="15"><path d="M8 7h3v10H8zM13 7h3v10h-3z" fill="currentColor"/></svg>
+          </button>
+
+          <div class="timebar-main">
+            <input id="timeline-slider" class="timeline-slider" type="range" min="0" max="100" value="100" step="1" aria-label="Harita tarihi" data-i18n-aria-label="timeline.year">
+            <div class="timebar-meta">
+              <span id="timeline-current" aria-live="polite">Tüm dönem</span>
+              <button id="timeline-all" class="text-button" type="button" data-i18n="time.showAll">Tümünü göster</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Sources view -->
+      <div id="sources-view" class="view sources-view" hidden>
+        <div class="view-toolbar">
+          <div class="view-heading">
+            <span class="eyebrow" data-i18n="sources.eyebrow">Arşiv</span>
+            <div class="view-title-row">
+              <h1 data-i18n="sources.title">Kaynak metinleri</h1>
+              <span id="sources-count" class="result-count"></span>
+            </div>
+            <p data-i18n="sources.subtitle">Kaynak metinlerde tam metin arama. Bir kaydı açarak ilgili atamayı görün.</p>
+          </div>
+        </div>
+
+        <div class="sources-body">
+          <form id="sources-form" class="sources-search" role="search">
+            <label class="sr-only" for="sources-query" data-i18n="sources.searchLabel">Kaynaklarda ara</label>
+            <div class="search-field">
+              <svg class="field-icon" aria-hidden="true" viewBox="0 0 24 24" width="16" height="16">
+                <circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="1.6"/>
+                <path d="m16 16 4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+              </svg>
+              <input id="sources-query" class="input search-input large" type="search" autocomplete="off" spellcheck="false" placeholder="Örn. kaza tevcih" data-i18n-placeholder="sources.placeholder">
+            </div>
+            <p class="field-note" data-i18n="sources.help">Birden fazla kelime tümüyle aranır; "tırnak" içindeki ifade aynen, -kelime hariç tutulur.</p>
+          </form>
+
+          <ol id="sources-list" class="sources-list" aria-live="polite"></ol>
+          <p id="sources-empty" class="sources-empty" hidden></p>
+          <button id="sources-more" class="secondary-button compact" type="button" hidden data-i18n="sources.more">Daha fazla göster</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- The drawer has tenure now. -->
+    <aside id="details-panel" class="details" aria-label="Seçili kayıt detayları" data-i18n-aria-label="details.aria">
+      <div class="details-header">
+        <div class="details-heading">
+          <span id="detail-eyebrow" class="eyebrow" data-i18n="details.eyebrow">Seçim</span>
+          <h2 id="detail-title" data-i18n="details.overview">Genel görünüm</h2>
+        </div>
+        <button id="close-details" class="icon-button details-close" type="button" aria-label="Detay panelini kapat" title="Kapat" data-i18n-aria-label="details.close" data-i18n-title="common.close">
+          <svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16"><path d="m7 7 10 10M17 7 7 17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+
+      <p id="detail-subtitle" class="detail-subtitle"></p>
+      <div id="detail-summary" class="detail-summary"></div>
+      <div id="detail-actions" class="detail-actions"></div>
+      <div id="detail-tabs" class="details-tabs" role="tablist" hidden></div>
+      <div id="detail-body" class="detail-body" role="tabpanel"></div>
+    </aside>
+  </main>
+
+  <button id="details-fab" class="details-fab" type="button" hidden data-i18n="details.open">Detaylar</button>
+
+  <dialog id="about-dialog" class="about-dialog" aria-labelledby="about-title">
+    <div class="about-inner">
+      <div class="about-header">
+        <div>
+          <span class="eyebrow" data-i18n="about.eyebrow">Yöntem</span>
+          <h2 id="about-title" data-i18n="about.title">Veriler nasıl okunmalı?</h2>
+        </div>
+        <button id="about-close" class="icon-button" type="button" aria-label="Kapat" data-i18n-aria-label="common.close">
+          <svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16"><path d="m7 7 10 10M17 7 7 17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+      <p data-i18n="about.intro">Kadı Atlası, Osmanlı kadı atama kayıtlarını harita, zaman ve kaynak metin üzerinden incelemek için hazırlanmış bir araştırma aracıdır. Aşağıdaki notlar verinin sınırlarını açıklar.</p>
+      <dl class="about-list">
+        <dt data-i18n="about.yearsTitle">Tarihler</dt>
+        <dd data-i18n="about.years">Kaynaktaki tarih ifadesi aynen korunur. Filtreleme için metindeki ilk 3–4 haneli sayı yıl olarak kullanılır; takvim (hicrî, rûmî…) henüz belirlenmemiştir ve bu sayı kesin bir miladi yıl değildir.</dd>
+        <dt data-i18n="about.identityTitle">Kişiler ve yerler</dt>
+        <dd data-i18n="about.identity">Aynı şekilde yazılan adlar geçici olarak tek kişi veya tek yer altında toplanır. Bu bir kimlik tespiti değildir; farklı kişiler aynı adı taşıyabilir.</dd>
+        <dt data-i18n="about.routeTitle">Güzergâhlar</dt>
+        <dd data-i18n="about.route">Bir kadının atamaları önce yıla göre sıralanır. Aynı yıl içindeki veya tarihsiz kayıtlarda eski yer → yeni yer bağlantısı izlenir (A→B, B→C…). Bağlantının koptuğu yerler ayrıca işaretlenir.</dd>
+        <dt data-i18n="about.colorsTitle">Renkler</dt>
+        <dd data-i18n="about.colors">Her kadı kendi rengiyle çizilir: ilk atama yerinde açık, güzergâh boyunca koyulaşır. Akış görünümünde çizgi kalınlığı kayıt sayısını gösterir; oklar yönü belirtir.</dd>
+        <dt data-i18n="about.mapTitle">Harita</dt>
+        <dd data-i18n="about.map">Yalnızca koordinatı girilmiş yerler haritada görünür. Kıyı çizgileri günümüz coğrafyasıdır (Natural Earth).</dd>
+      </dl>
+    </div>
+  </dialog>
+
+  <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="false"></div>
+
+  <noscript>
+    <div class="noscript">
+      Bu uygulamanın etkileşimli harita ve sorgu özellikleri için JavaScript gereklidir.
+      /
+      JavaScript is required for the interactive map and query features.
+    </div>
+  </noscript>
+</body>
+</html>

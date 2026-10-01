@@ -1,0 +1,22 @@
+# Local development database only. The application itself is run with `cargo`.
+# Not intended for production.
+
+services:
+  db:
+    image: postgis/postgis:17-3.5
+    environment:
+      POSTGRES_USER: kadi
+      POSTGRES_PASSWORD: kadi
+      POSTGRES_DB: kadi_atlas
+    ports:
+      - "5432:5432"
+    volumes:
+      - kadi_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kadi -d kadi_atlas"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  kadi_pgdata:

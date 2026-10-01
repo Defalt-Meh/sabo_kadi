@@ -1,0 +1,47 @@
+[Unit]
+Description=Kadı Atlas read-only research API
+Documentation=https://example.org/kadi-atlas
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=kadi-atlas
+Group=kadi-atlas
+
+# Binary and working directory (adjust to your install layout).
+WorkingDirectory=/opt/kadi-atlas
+ExecStart=/opt/kadi-atlas/bin/kadi-atlas
+
+# Configuration comes from the environment. Keep secrets in an 0640 file owned
+# by the service user; DATABASE_URL lives there.
+EnvironmentFile=/etc/kadi-atlas/kadi-atlas.env
+Environment=KADI_ATLAS__BIND_ADDR=127.0.0.1:8080
+Environment=KADI_ATLAS__LOG_FORMAT=json
+Environment=KADI_ATLAS__AUTO_MIGRATE=false
+Environment=RUST_LOG=info,kadi_atlas=info,tower_http=info,sqlx=warn
+
+# Graceful shutdown: the server drains on SIGTERM.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+
+# Hardening.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+ReadWritePaths=
+
+[Install]
+WantedBy=multi-user.target
