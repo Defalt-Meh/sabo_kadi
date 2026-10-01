@@ -30,7 +30,6 @@ struct Args {
     migrate: bool,
 }
 
-//! Migration error, check this function for later use -Defalt
 fn parse_args() -> Result<Args> {
     let mut path: Option<PathBuf> = None;
     let mut options = ImportOptions::default();

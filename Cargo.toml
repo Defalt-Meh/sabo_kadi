@@ -14,10 +14,12 @@ path = "src/lib.rs"
 [[bin]]
 name = "kadi-atlas"
 path = "src/main.rs"
+test = false
 
 [[bin]]
 name = "import_xlsx"
 path = "src/bin/import_xlsx.rs"
+test = false
 
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }

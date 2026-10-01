@@ -33,6 +33,14 @@ const MISSING_PLACEHOLDERS: &[&str] = &[
 /// Trim a raw cell and return `None` if it is empty or a missing-data placeholder.
 /// The returned string is the trimmed original (case and diacritics preserved) —
 /// suitable for storing as a `canonical_name` / `raw_*` value.
+///
+/// ```
+/// use kadi_atlas::normalize::clean_opt;
+///
+/// assert_eq!(clean_opt("  Üsküdar "), Some("Üsküdar".to_string()));
+/// assert_eq!(clean_opt("yok"), None);
+/// assert_eq!(clean_opt("   "), None);
+/// ```
 pub fn clean_opt(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -48,6 +56,13 @@ pub fn clean_opt(raw: &str) -> Option<String> {
 /// Produce a normalized key for provisional grouping:
 /// lower-cased, Turkish diacritics folded to ASCII, punctuation collapsed to
 /// spaces, whitespace collapsed. Returns `None` for empty / placeholder input.
+///
+/// ```
+/// use kadi_atlas::normalize::normalize_key;
+///
+/// assert_eq!(normalize_key("Şeyh-ül İslâm").as_deref(), Some("seyh ul islam"));
+/// assert_eq!(normalize_key("?"), None);
+/// ```
 pub fn normalize_key(raw: &str) -> Option<String> {
     let cleaned = clean_opt(raw)?;
 
@@ -103,6 +118,13 @@ fn fold_char(ch: char) -> Vec<char> {
 /// Extracts the first run of 3 or 4 ASCII digits from the raw date string. This
 /// is deliberately calendar-agnostic: it does not convert Hijri/Rumi to
 /// Gregorian and must not be treated as an authoritative year.
+///
+/// ```
+/// use kadi_atlas::normalize::extract_year_numeric;
+///
+/// assert_eq!(extract_year_numeric("gurre-i Receb 1150"), Some(1150));
+/// assert_eq!(extract_year_numeric("evahir-i Şaban"), None);
+/// ```
 pub fn extract_year_numeric(raw: &str) -> Option<i32> {
     let bytes = raw.as_bytes();
     let mut i = 0;
@@ -125,6 +147,13 @@ pub fn extract_year_numeric(raw: &str) -> Option<i32> {
 
 /// Parse a coordinate cell into a finite `f64`, accepting comma decimal
 /// separators. Returns `None` for blank / non-numeric / non-finite input.
+///
+/// ```
+/// use kadi_atlas::normalize::parse_coordinate;
+///
+/// assert_eq!(parse_coordinate(" 39,9334 "), Some(39.9334));
+/// assert_eq!(parse_coordinate("NaN"), None);
+/// ```
 pub fn parse_coordinate(raw: &str) -> Option<f64> {
     let cleaned = clean_opt(raw)?;
     let normalized = cleaned.replace(',', ".");

@@ -191,3 +191,74 @@ impl<T> Page<T> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    fn state() -> AppState {
+        AppState {
+            // Never connects: these tests only read the page-size settings.
+            pool: PgPoolOptions::new()
+                .connect_lazy("postgres://unused@localhost/unused")
+                .unwrap(),
+            default_page_size: 50,
+            max_page_size: 200,
+        }
+    }
+
+    fn page(limit: Option<i64>, offset: Option<i64>) -> ApiResult<(i64, i64)> {
+        resolve_page(limit, offset, &state()).map(|p| (p.limit, p.offset))
+    }
+
+    #[tokio::test]
+    async fn page_defaults_and_bounds() {
+        assert_eq!(page(None, None).unwrap(), (50, 0));
+        assert_eq!(page(Some(1), Some(0)).unwrap(), (1, 0));
+        assert_eq!(page(Some(200), Some(10_000_000)).unwrap(), (200, 10_000_000));
+    }
+
+    #[tokio::test]
+    async fn page_rejects_out_of_range_values() {
+        for (limit, offset) in [
+            (Some(0), None),
+            (Some(-1), None),
+            (Some(201), None),
+            (None, Some(-1)),
+            (None, Some(10_000_001)),
+        ] {
+            assert!(
+                matches!(page(limit, offset), Err(ApiError::BadRequest(_))),
+                "limit={limit:?} offset={offset:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn year_range_must_be_ordered() {
+        assert!(validate_year_range(None, None).is_ok());
+        assert!(validate_year_range(Some(1100), None).is_ok());
+        assert!(validate_year_range(None, Some(1100)).is_ok());
+        assert!(validate_year_range(Some(1100), Some(1100)).is_ok());
+        assert!(validate_year_range(Some(1100), Some(1200)).is_ok());
+        assert!(matches!(
+            validate_year_range(Some(1200), Some(1100)),
+            Err(ApiError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn refs_require_an_id() {
+        assert!(PlaceRef::from_parts(None, Some("Bursa".into()), None, None).is_none());
+        let place = PlaceRef::from_parts(Some(7), None, Some(40.18), Some(29.06)).unwrap();
+        assert_eq!(place.id, 7);
+        assert_eq!(place.canonical_name, "");
+        assert_eq!((place.latitude, place.longitude), (Some(40.18), Some(29.06)));
+
+        assert!(PersonRef::from_parts(None, Some("Ahmed".into()), None).is_none());
+        let person = PersonRef::from_parts(Some(3), Some("Ahmed".into()), None).unwrap();
+        assert_eq!(person.canonical_name, "Ahmed");
+        assert_eq!(person.resolution_status, "");
+    }
+}
