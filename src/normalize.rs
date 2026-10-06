@@ -28,7 +28,22 @@ const MISSING_PLACEHOLDERS: &[&str] = &[
     "none",
     "boş",
     "bos",
+    // cells where the upstream extraction failed
+    "error",
+    "#error",
 ];
+
+/// Ayn / hamza marks as they appear in the transliterations. The same mark is
+/// typed with many different code points (`maʻişet`, `ma‘işet`, `ma`işet`,
+/// `maՙişet`, ...); all of them are dropped when building keys.
+const TRANSLITERATION_MARKS: &[char] =
+    &['ʿ', 'ʾ', 'ʻ', 'ʼ', '‘', '’', '‛', '\'', '`', '´', 'ՙ', 'ꞌ'];
+
+/// Plausible range for `year_numeric`. The corpus is dated in Hijri (or Rumi)
+/// years; anything outside this window is a transcription/extraction error
+/// (e.g. a whole document tagged `1556`). Such years stay in `year_original`
+/// but are not used for filtering.
+pub const PLAUSIBLE_YEARS: std::ops::RangeInclusive<i32> = 600..=1350;
 
 /// Trim a raw cell and return `None` if it is empty or a missing-data placeholder.
 /// The returned string is the trimmed original (case and diacritics preserved) —
@@ -106,11 +121,44 @@ fn fold_char(ch: char) -> Vec<char> {
         'û' | 'Û' | 'ú' | 'ū' => vec!['u'],
         'ê' | 'Ê' | 'é' | 'è' => vec!['e'],
         'ô' | 'Ô' | 'ó' => vec!['o'],
-        'ʿ' | 'ʾ' | '\'' | '`' | '’' | '‘' => vec![], // drop hamza/ayn markers
+        c if TRANSLITERATION_MARKS.contains(&c) => vec![], // drop hamza/ayn markers
         c if c.is_ascii_alphanumeric() => vec![c.to_ascii_lowercase()],
         c if c.is_alphanumeric() => c.to_lowercase().collect(),
         _ => vec![' '],
     }
+}
+
+/// Fold a short vocabulary value (`position_type`, `degree`) so spelling
+/// variants group together: lower-cased (Turkish-aware), ayn/hamza marks
+/// dropped, a trailing izafet (`-i`, `-ı`, `-ü`, `-u`) removed. Diacritics are
+/// kept, so the value stays readable. Returns `None` for blank / placeholder.
+///
+/// ```
+/// use kadi_atlas::normalize::fold_term;
+///
+/// assert_eq!(fold_term("Maʻişet-i").as_deref(), Some("maişet"));
+/// assert_eq!(fold_term("te’bid").as_deref(), Some("tebid"));
+/// assert_eq!(fold_term("-"), None);
+/// ```
+pub fn fold_term(raw: &str) -> Option<String> {
+    let cleaned = clean_opt(raw)?;
+    let mut out = String::with_capacity(cleaned.len());
+    for ch in cleaned.chars() {
+        match ch {
+            'I' => out.push('ı'),
+            'İ' => out.push('i'),
+            c if TRANSLITERATION_MARKS.contains(&c) => {}
+            c => out.extend(c.to_lowercase()),
+        }
+    }
+    let mut folded = out.trim();
+    for suffix in ["-i", "-ı", "-ü", "-u"] {
+        if let Some(stripped) = folded.strip_suffix(suffix) {
+            folded = stripped.trim_end();
+            break;
+        }
+    }
+    clean_opt(folded)
 }
 
 /// Best-effort integer year for range filtering ONLY.
@@ -189,6 +237,37 @@ mod tests {
             Some("el hac ahmed efendi")
         );
         assert_eq!(normalize_key("-"), None);
+        assert_eq!(normalize_key("ERROR"), None);
+        // every ayn/hamza spelling folds to the same key
+        for v in [
+            "Maʼarretüʼn-Nuʻmân",
+            "Ma‘arretü’n-Nu`mân",
+            "Maarretün-Numan",
+        ] {
+            assert_eq!(normalize_key(v).as_deref(), Some("maarretun numan"), "{v}");
+        }
+    }
+
+    #[test]
+    fn vocabulary_terms_fold_variants() {
+        for v in [
+            "maişet",
+            "maʻişet",
+            "ma‘işet",
+            "ma`işet",
+            "maʿişet",
+            "maՙişet",
+            "maʻişet-i",
+        ] {
+            assert_eq!(fold_term(v).as_deref(), Some("maişet"), "{v}");
+        }
+        for v in ["tebid", "te’bid", "te'bid", "te‘bid", "te‛bid", "teꞌbid"] {
+            assert_eq!(fold_term(v).as_deref(), Some("tebid"), "{v}");
+        }
+        assert_eq!(fold_term("Arpalık").as_deref(), Some("arpalık"));
+        assert_eq!(fold_term("ilhak-ı").as_deref(), Some("ilhak"));
+        assert_eq!(fold_term("ba-samine").as_deref(), Some("ba-samine"));
+        assert_eq!(fold_term(" - "), None);
     }
 
     #[test]

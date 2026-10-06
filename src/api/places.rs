@@ -28,6 +28,8 @@ pub struct PlaceListItem {
     pub normalized_name: String,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
+    /// `source_row` | `gazetteer`; `None` when the place has no coordinates.
+    pub coordinate_source: Option<String>,
     pub wikidata_qid: Option<String>,
     pub inflow_count: i64,
     pub outflow_count: i64,
@@ -49,7 +51,8 @@ pub async fn list(
     let total: i64 = count_qb.build_query_scalar().fetch_one(&state.pool).await?;
 
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
-        "SELECT p.id, p.canonical_name, p.normalized_name, p.latitude, p.longitude, p.wikidata_qid, \
+        "SELECT p.id, p.canonical_name, p.normalized_name, p.latitude, p.longitude, \
+         p.coordinate_source, p.wikidata_qid, \
          (SELECT count(*) FROM appointments a WHERE a.destination_place_id = p.id) AS inflow_count, \
          (SELECT count(*) FROM appointments a WHERE a.origin_place_id = p.id) AS outflow_count \
          FROM places p",
@@ -120,9 +123,13 @@ pub struct PlaceDetail {
     pub normalized_name: String,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
+    pub coordinate_source: Option<String>,
     pub wikidata_qid: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// The gazetteer row delivered for this name, with the importer's verdict
+    /// (explains why a place has — or lacks — coordinates).
+    pub gazetteer: Option<super::gazetteer::GazetteerEntry>,
     pub names: Vec<PlaceName>,
     pub stats: PlaceStats,
     /// Persons connected to this place, most active first (capped).
@@ -161,6 +168,7 @@ struct PlaceRow {
     normalized_name: String,
     latitude: Option<f64>,
     longitude: Option<f64>,
+    coordinate_source: Option<String>,
     wikidata_qid: Option<String>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
@@ -187,13 +195,15 @@ pub async fn detail(
     Path(id): Path<i64>,
 ) -> ApiResult<Json<PlaceDetail>> {
     let place = sqlx::query_as::<_, PlaceRow>(
-        "SELECT id, canonical_name, normalized_name, latitude, longitude, wikidata_qid, \
-         created_at, updated_at FROM places WHERE id = $1",
+        "SELECT id, canonical_name, normalized_name, latitude, longitude, coordinate_source, \
+         wikidata_qid, created_at, updated_at FROM places WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(&state.pool)
     .await?
     .ok_or_else(|| ApiError::not_found(format!("place {id} not found")))?;
+
+    let gazetteer = super::gazetteer::for_name(&state, &place.normalized_name).await?;
 
     let names = sqlx::query_as::<_, PlaceName>(
         "SELECT name, valid_from, valid_to, calendar::text AS calendar, language, source_reference \
@@ -259,9 +269,11 @@ pub async fn detail(
         normalized_name: place.normalized_name,
         latitude: place.latitude,
         longitude: place.longitude,
+        coordinate_source: place.coordinate_source,
         wikidata_qid: place.wikidata_qid,
         created_at: place.created_at,
         updated_at: place.updated_at,
+        gazetteer,
         names,
         stats: PlaceStats {
             inbound_appointments: stats.inbound_appointments,

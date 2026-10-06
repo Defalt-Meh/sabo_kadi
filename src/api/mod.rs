@@ -3,6 +3,7 @@
 mod activity;
 mod appointments;
 mod flows;
+mod gazetteer;
 mod health;
 mod meta;
 mod persons;
@@ -30,6 +31,7 @@ pub fn router() -> Router<AppState> {
         .route("/appointments", get(appointments::list))
         .route("/flows", get(flows::list))
         .route("/place-activity", get(activity::places))
+        .route("/gazetteer", get(gazetteer::list))
         .route("/sources", get(sources::list))
         .route("/sources/{id}", get(sources::detail))
 }

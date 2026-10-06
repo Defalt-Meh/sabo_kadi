@@ -30,6 +30,16 @@ struct Counts {
     places_with_coordinates: i64,
     appointments: i64,
     appointments_with_flow: i64,
+    /// Rows hidden because they transcribe an entry already counted.
+    duplicate_transcriptions: i64,
+    gazetteer: GazetteerCounts,
+}
+
+#[derive(Serialize)]
+struct GazetteerCounts {
+    accepted: i64,
+    needs_review: i64,
+    rejected: i64,
 }
 
 #[derive(Serialize)]
@@ -42,6 +52,7 @@ struct YearSpan {
 struct MetaNotes {
     year_numeric: &'static str,
     identity: &'static str,
+    coordinates: &'static str,
 }
 
 pub async fn meta(State(state): State<AppState>) -> ApiResult<Json<Meta>> {
@@ -57,6 +68,10 @@ pub async fn meta(State(state): State<AppState>) -> ApiResult<Json<Meta>> {
             (SELECT count(*) FROM appointments
                  WHERE origin_place_id IS NOT NULL
                    AND destination_place_id IS NOT NULL)                          AS appointments_with_flow,
+            (SELECT count(*) FROM appointment_records WHERE duplicate_of IS NOT NULL) AS duplicate_transcriptions,
+            (SELECT count(*) FROM gazetteer_entries WHERE coordinate_status = 'accepted')     AS gazetteer_accepted,
+            (SELECT count(*) FROM gazetteer_entries WHERE coordinate_status = 'needs_review') AS gazetteer_needs_review,
+            (SELECT count(*) FROM gazetteer_entries WHERE coordinate_status = 'rejected')     AS gazetteer_rejected,
             (SELECT min(year_numeric) FROM appointments)                           AS year_min,
             (SELECT max(year_numeric) FROM appointments)                           AS year_max
         "#,
@@ -83,6 +98,12 @@ pub async fn meta(State(state): State<AppState>) -> ApiResult<Json<Meta>> {
             places_with_coordinates: row.places_with_coordinates,
             appointments: row.appointments,
             appointments_with_flow: row.appointments_with_flow,
+            duplicate_transcriptions: row.duplicate_transcriptions,
+            gazetteer: GazetteerCounts {
+                accepted: row.gazetteer_accepted,
+                needs_review: row.gazetteer_needs_review,
+                rejected: row.gazetteer_rejected,
+            },
         },
         year_numeric_range: YearSpan {
             min: row.year_min,
@@ -98,6 +119,10 @@ pub async fn meta(State(state): State<AppState>) -> ApiResult<Json<Meta>> {
             identity:
                 "persons/places are provisional groupings by normalized name, not confirmed \
                  historical identities.",
+            coordinates:
+                "Place coordinates come from a third-party gazetteer and are used only when they \
+                 pass validation (inside the study region, settlement-level precision). See \
+                 /api/v1/gazetteer for every delivered point and its verdict.",
         },
     }))
 }
@@ -125,6 +150,10 @@ struct MetaRow {
     places_with_coordinates: i64,
     appointments: i64,
     appointments_with_flow: i64,
+    duplicate_transcriptions: i64,
+    gazetteer_accepted: i64,
+    gazetteer_needs_review: i64,
+    gazetteer_rejected: i64,
     year_min: Option<i32>,
     year_max: Option<i32>,
 }

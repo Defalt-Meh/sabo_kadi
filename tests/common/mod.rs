@@ -61,28 +61,39 @@ pub enum Cell {
 /// Write a `.xlsx` fixture with the given header row and data rows into a fresh
 /// temp file; returns the path (kept alive by the returned `TempDir`).
 pub fn write_fixture(headers: &[&str], rows: &[Vec<Cell>]) -> (tempfile::TempDir, PathBuf) {
+    write_workbook(&[("Kayitlar", headers, rows)])
+}
+
+/// `(sheet name, header row, data rows)`.
+pub type SheetSpec<'a> = (&'a str, &'a [&'a str], &'a [Vec<Cell>]);
+
+/// Write a multi-sheet `.xlsx` fixture. A data row may be wider than its
+/// header row (unlabelled columns).
+pub fn write_workbook(sheets: &[SheetSpec]) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("fixture.xlsx");
 
     let mut workbook = Workbook::new();
-    let sheet = workbook.add_worksheet();
-    sheet.set_name("Kayitlar").unwrap();
+    for (name, headers, rows) in sheets {
+        let sheet = workbook.add_worksheet();
+        sheet.set_name(*name).unwrap();
 
-    for (c, h) in headers.iter().enumerate() {
-        sheet.write(0, c as u16, *h).unwrap();
-    }
-    for (r, row) in rows.iter().enumerate() {
-        let excel_row = (r + 1) as u32;
-        for (c, cell) in row.iter().enumerate() {
-            let col = c as u16;
-            match cell {
-                Cell::S(s) => {
-                    sheet.write(excel_row, col, *s).unwrap();
+        for (c, h) in headers.iter().enumerate() {
+            sheet.write(0, c as u16, *h).unwrap();
+        }
+        for (r, row) in rows.iter().enumerate() {
+            let excel_row = (r + 1) as u32;
+            for (c, cell) in row.iter().enumerate() {
+                let col = c as u16;
+                match cell {
+                    Cell::S(s) => {
+                        sheet.write(excel_row, col, *s).unwrap();
+                    }
+                    Cell::N(n) => {
+                        sheet.write(excel_row, col, *n).unwrap();
+                    }
+                    Cell::Empty => {}
                 }
-                Cell::N(n) => {
-                    sheet.write(excel_row, col, *n).unwrap();
-                }
-                Cell::Empty => {}
             }
         }
     }
@@ -90,6 +101,37 @@ pub fn write_fixture(headers: &[&str], rows: &[Vec<Cell>]) -> (tempfile::TempDir
     workbook.save(&path).expect("save xlsx fixture");
     (dir, path)
 }
+
+/// Appointment sheet header row exactly as delivered (`onaylı_data.xlsx`).
+pub const DELIVERED_HEADERS: &[&str] = &[
+    "doc_id",
+    "date",
+    "varak_no",
+    "certificate",
+    "degree",
+    "position type",
+    "period",
+    "salary",
+    "old_salary",
+    "asitane",
+    "infisal",
+    "old_kadi",
+    "new_kadi",
+    "old_place",
+    "new_place",
+    "text",
+];
+
+/// Gazetteer header row as delivered: the longitude column has no header.
+pub const GAZETTEER_HEADERS: &[&str] = &[
+    "original_name",
+    "matched_name",
+    "wikidata_id",
+    "wikipedia_url",
+    "country",
+    "official_website",
+    "lat",
+];
 
 /// The full standard column set, in the order the project documents.
 pub const STD_HEADERS: &[&str] = &[

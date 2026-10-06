@@ -64,6 +64,32 @@ sync by a `BEFORE INSERT/UPDATE` trigger, and a GiST index on `geom`.
 added later; the importer fills them only when currently NULL and never
 overwrites an existing pair silently.
 
+`coordinate_source` records where a point came from (`source_row` |
+`gazetteer`).
+
+### `gazetteer_entries`
+The delivered place → coordinate table (one row per normalized name), kept
+verbatim (`raw`, `raw_latitude`, `raw_longitude`) with the importer's verdict:
+`coordinate_status` ∈ `accepted | needs_review | rejected` and an `issues`
+array. Linked to `places` by `normalized_name`, not by id, so a gazetteer can
+arrive before or after the appointment sheets that mention the place. The
+coordinates are third-party Wikidata matches and are known to contain wrong
+matches; validation rules live in `src/geo.rs`:
+
+- **rejected** — missing/unparseable, out of range, or outside the study
+  region bounding box (lat 10–49.5, lon −10–60; the Ottoman world at its
+  widest). `possibly_swapped` is added when the swapped pair would fit.
+- **needs_review** — integer-precision points (country centroids) and matches
+  whose name says area rather than town (`Governorate`, `Province`, `eyalet`,
+  the country itself, `Plain of …`), and a name delivered twice with points
+  more than 5 km apart.
+- **informational** — `name_mismatch` (renames such as Larende → Karaman,
+  but also wrong matches that land inside the region), `shared_coordinates`,
+  `shared_wikidata`.
+
+Only `accepted` points are copied onto `places`; the sync runs at the end of
+every import and withdraws gazetteer points that are no longer accepted.
+
 ### `place_names`
 Historical / variant names: `place_id`, `name`, `normalized_name`, `valid_from`,
 `valid_to` (integer years, open-ended when NULL), `calendar`, `language`,
@@ -71,7 +97,15 @@ Historical / variant names: `place_id`, `name`, `normalized_name`, `valid_from`,
 (`calendar = 'unknown'`, no validity range, deduped by a partial unique index).
 The validity-range columns are for researcher-curated name history added later.
 
-### `appointments`
+### `appointment_records` / `appointments`
+`appointment_records` holds one event row per spreadsheet row; `appointments`
+is a view over it that hides rows marked `duplicate_of` (the same register
+entry transcribed again in another document, detected by an md5 of the
+normalized `text` — `source_records.text_fingerprint`). The importer writes
+the table; the API reads the view, so counts, flows and journeys are not
+inflated. The kept copy is the first by `doc_id`, preferring documents without
+a `(1)` copy suffix.
+
 One event row per spreadsheet row (`source_record_id` unique → re-import
 upserts). Columns:
 
@@ -101,7 +135,8 @@ The API needs `year_from` / `year_to` filtering and flow windows, but the source
 `tarih` column is free text in an unknown calendar. `year_numeric` is a
 **best-effort integer**: the first run of 3–4 digits found in `year_original`
 (`"Ramazan 1125"` → `1125`, `"H. 1234 / M. 1819"` → `1234`, `"evahir-i
-Muharrem"` → `NULL`). It is:
+Muharrem"` → `NULL`). Values outside 600–1350 are discarded as transcription
+errors (the raw string is kept). It is:
 
 - **calendar-agnostic** — no Hijri→Gregorian conversion is performed;
 - **not authoritative** — it must not be shown as "the year";
@@ -166,3 +201,13 @@ This is the main thing historians should review (below).
    queryable?
 10. **Duplicates without `doc_id`.** If the source can ship rows with no stable
     id, what is the natural key (e.g. `varak_no` + parties + year)?
+11. **Gazetteer review.** Validation only catches matches that are far off or
+    coarse. A wrong match with a similar name inside the region passes
+    (`Sayda` → Saida, Syria instead of Sidon, Lebanon); renames are accepted
+    but flagged `name_mismatch`. Who reviews accepted entries, and how are
+    corrections delivered?
+12. **Medrese origins.** ~2.6k origins read `İstanbul’da X Medresesinden`
+    (a teaching post, not a kadılık). Should they map to İstanbul, or be a
+    separate kind of origin?
+13. **Self-moves.** Rows with `old_place = new_place` (reappointment at the same
+    seat) currently appear as `Kilis → Kilis` flows.

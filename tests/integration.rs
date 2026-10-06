@@ -613,3 +613,275 @@ async fn serves_frontend_with_its_own_csp_when_configured() {
     );
     assert_eq!(fetch("/api/v1/nope").await.status(), StatusCode::NOT_FOUND);
 }
+
+/// One appointment row in the delivered column layout.
+fn delivered_row(
+    doc_id: &'static str,
+    date: Cell,
+    position: &'static str,
+    old_place: &'static str,
+    new_place: &'static str,
+    text: &'static str,
+) -> Vec<Cell> {
+    vec![
+        Cell::S(doc_id),
+        date,
+        Cell::S("1b"),
+        Cell::Empty,
+        Cell::Empty,
+        Cell::S(position),
+        Cell::S("müddet-i örfiyye"),
+        Cell::N(150.0),
+        Cell::N(40.0),
+        Cell::N(0.0),
+        Cell::N(12.0),
+        Cell::S("Gzperson Eski "),
+        Cell::S("Gzperson Yeni"),
+        Cell::S(old_place),
+        Cell::S(new_place),
+        Cell::S(text),
+    ]
+}
+
+/// One gazetteer row; the 8th cell (longitude) sits under no header.
+fn gaz_row(
+    name: &'static str,
+    matched: &'static str,
+    qid: &'static str,
+    country: &'static str,
+    lat: &'static str,
+    lon: &'static str,
+) -> Vec<Cell> {
+    vec![
+        Cell::S(name),
+        Cell::S(matched),
+        Cell::S(qid),
+        Cell::Empty,
+        Cell::S(country),
+        Cell::Empty,
+        Cell::S(lat),
+        Cell::S(lon),
+    ]
+}
+
+#[tokio::test]
+async fn delivered_workbook_with_untrusted_gazetteer() {
+    let (app, pool) = common::setup_app().await;
+
+    let gazetteer = vec![
+        gaz_row(
+            "Gztown Alfa",
+            "Gztown Alfa",
+            "Q4242001",
+            "Turkey",
+            "38.4192",
+            "27.1287",
+        ),
+        // wrong match on the other side of the world
+        gaz_row(
+            "Gztown Kudüs",
+            "Kudus",
+            "Q4242002",
+            "Indonesia",
+            "-6.8",
+            "110.84",
+        ),
+        // a whole country's centroid
+        gaz_row("Gztown Mısır", "Egypt", "Q4242003", "Egypt", "27.", "29."),
+    ];
+    const TEXT_A: &str = "Gztown Alfa kadısı Gzperson Eski sene-i mezbure gurresinden ref ve \
+                          yeri yevmi kırk akçe ile tevcih olunub sadaka buyuruldu (A)";
+    let appointments = vec![
+        delivered_row(
+            "### Gzdoc.docx_1",
+            Cell::N(1161.0),
+            "te’bid",
+            "Gztown Kudüs ",
+            "Gztown Alfa ",
+            TEXT_A,
+        ),
+        // the same register entry, transcribed again in a copied document
+        delivered_row(
+            "### Gzdoc (1).docx_1",
+            Cell::N(1161.0),
+            "te'bid",
+            "Gztown Kudüs ",
+            "Gztown Alfa ",
+            TEXT_A,
+        ),
+        delivered_row(
+            "### Gzdoc.docx_2",
+            Cell::N(1556.0),
+            "maʻişet-i",
+            "Gztown Alfa ",
+            "ERROR",
+            "Gztown Beta kadısı ... a different entry whose date was mis-transcribed (B)",
+        ),
+        delivered_row(
+            "### Gzdoc.docx_3",
+            Cell::S("1167]"),
+            "tebid",
+            "Gztown Alfa ",
+            "Gztown Mısır ",
+            "Gztown Mısır kadılığı ... yet another distinct register entry for the test (C)",
+        ),
+    ];
+    let (_d, path) = common::write_workbook(&[
+        ("atamalar", common::DELIVERED_HEADERS, &appointments),
+        ("kazalar", common::GAZETTEER_HEADERS, &gazetteer),
+    ]);
+
+    let report = import_path(&pool, &path, &ImportOptions::default())
+        .await
+        .unwrap();
+    // gazetteer first, whatever the sheet order
+    assert_eq!(report.sheets[0].0, "kazalar");
+    assert_eq!(report.sheets[1].0, "atamalar");
+    let g = &report.gazetteer;
+    assert_eq!((g.accepted, g.needs_review, g.rejected), (1, 1, 1));
+    assert!(report
+        .warnings
+        .iter()
+        .any(|w| w.contains("no longitude header")));
+    assert_eq!(report.implausible_years.get("1556"), Some(&1));
+    assert_eq!(report.place_cells_error, 1);
+
+    // only the accepted point reaches places
+    let place = |name: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<
+                _,
+                (
+                    i64,
+                    Option<f64>,
+                    Option<f64>,
+                    Option<String>,
+                    Option<String>,
+                ),
+            >(
+                "SELECT id, latitude, longitude, coordinate_source, wikidata_qid \
+                 FROM places WHERE normalized_name = $1",
+            )
+            .bind(name)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let alfa = place("gztown alfa").await;
+    assert_eq!((alfa.1, alfa.2), (Some(38.4192), Some(27.1287)));
+    assert_eq!(alfa.3.as_deref(), Some("gazetteer"));
+    assert_eq!(alfa.4.as_deref(), Some("Q4242001"));
+    let kudus = place("gztown kudus").await;
+    assert_eq!(
+        (kudus.1, kudus.3.as_deref(), kudus.4.as_deref()),
+        (None, None, None)
+    );
+    let misir = place("gztown misir").await;
+    assert_eq!(misir.1, None);
+    // `ERROR` never became a place
+    let error_places: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM places WHERE normalized_name = 'error'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(error_places, 0);
+
+    // duplicate transcription: kept as evidence, hidden from the event list
+    let (all, visible): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM appointment_records a JOIN source_records s ON s.id = a.source_record_id \
+                  WHERE s.doc_id LIKE '### Gzdoc%'), \
+                (SELECT count(*) FROM appointments a JOIN source_records s ON s.id = a.source_record_id \
+                  WHERE s.doc_id LIKE '### Gzdoc%')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((all, visible), (4, 3));
+    let kept_doc: String = sqlx::query_scalar(
+        "SELECT s.doc_id FROM appointment_records d \
+         JOIN appointment_records k ON k.id = d.duplicate_of \
+         JOIN source_records s ON s.id = k.source_record_id \
+         JOIN source_records ds ON ds.id = d.source_record_id \
+         WHERE ds.doc_id = '### Gzdoc (1).docx_1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(kept_doc, "### Gzdoc.docx_1");
+
+    // dates: implausible year kept as text only; `1167]` still parses
+    let years: Vec<(String, Option<String>, Option<i32>)> = sqlx::query_as(
+        "SELECT s.doc_id, a.year_original, a.year_numeric FROM appointments a \
+         JOIN source_records s ON s.id = a.source_record_id \
+         WHERE s.doc_id LIKE '### Gzdoc%' ORDER BY s.doc_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        years[1],
+        ("### Gzdoc.docx_2".into(), Some("1556".into()), None)
+    );
+    assert_eq!(years[2].2, Some(1167));
+
+    // vocabulary variants folded, and API filters fold their input too
+    let (s, body) = get(
+        &app,
+        &format!(
+            "/api/v1/appointments?position_type=te%E2%80%99bid&place={}",
+            alfa.0
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["total"], 2, "{body}");
+    assert_eq!(body["items"][0]["position_type"], "tebid");
+
+    // review surface
+    let (_, body) = get(&app, "/api/v1/gazetteer?status=rejected&q=gztown").await;
+    assert_eq!(body["total"], 1);
+    assert_eq!(body["items"][0]["original_name"], "Gztown Kudüs");
+    assert_eq!(body["items"][0]["issues"][0], "outside_study_region");
+    assert_eq!(body["items"][0]["place_id"], kudus.0);
+    let (_, body) = get(&app, &format!("/api/v1/places/{}", misir.0)).await;
+    assert_eq!(body["latitude"], Value::Null);
+    assert_eq!(body["gazetteer"]["coordinate_status"], "needs_review");
+
+    // re-import is idempotent
+    let again = import_path(&pool, &path, &ImportOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(again.source_records_inserted, 0);
+    assert_eq!(again.gazetteer.inserted, 0);
+    assert_eq!(again.gazetteer.coordinates_applied, 0);
+
+    // a corrected delivery that moves Alfa out of the study region withdraws
+    // its point instead of keeping a stale one
+    let corrected = vec![gaz_row(
+        "Gztown Alfa",
+        "Alfa, Chile",
+        "Q4242001",
+        "Chile",
+        "-33.4",
+        "-70.6",
+    )];
+    let (_d2, path2) =
+        common::write_workbook(&[("kazalar", common::GAZETTEER_HEADERS, &corrected)]);
+    let r = import_path(&pool, &path2, &ImportOptions::default())
+        .await
+        .unwrap();
+    let alfa = place("gztown alfa").await;
+    assert_eq!(
+        (alfa.1, alfa.3.as_deref()),
+        (None, None),
+        "{:?}",
+        r.gazetteer
+    );
+    assert!(
+        r.gazetteer.coordinates_withdrawn >= 1,
+        "withdrawal not reported: {:?}",
+        r.gazetteer
+    );
+}

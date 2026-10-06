@@ -70,9 +70,9 @@ migrations as a separate deploy step (e.g. a one-off `import_xlsx` invocation or
 ## 4. Importing XLSX data
 
 ```bash
-cargo run --bin import_xlsx -- path/to/data.xlsx
+cargo run --bin import_xlsx -- data/onaylı_data.xlsx
 # options:
-#   --sheet <name>   pick a worksheet (default: first sheet)
+#   --sheet <name>   import only this worksheet (default: every recognised sheet)
 #   --dry-run        parse + validate, then roll back
 #   --no-migrate     skip the migration step
 ```
@@ -84,6 +84,33 @@ cargo run --example generate_sample_xlsx -- data/sample.xlsx
 cargo run --bin import_xlsx -- data/sample.xlsx
 ```
 
+A workbook may contain two kinds of sheets, recognised by their headers:
+
+- **appointment** sheets (`doc_id, date, varak_no, certificate, degree,
+  position type, period, salary, old_salary, asitane, infisal, old_kadi,
+  new_kadi, old_place, new_place, text`);
+- a **gazetteer** sheet (`original_name, matched_name, wikidata_id,
+  wikipedia_url, country, official_website, lat, lon`) giving coordinates per
+  place name. If the longitude column has no header (as in the delivered
+  `kazalar` sheet), the unlabelled column right after `lat` is used, with a
+  warning. A gazetteer can also be delivered later as its own workbook.
+
+Gazetteer coordinates are **not trusted blindly**. Each row is validated and
+gets a `coordinate_status`:
+
+| status | meaning | examples |
+| --- | --- | --- |
+| `accepted` | copied onto the place, drawn on the map | Antakya, Larende → Karaman |
+| `needs_review` | plausible but not a town: country/province/governorate centroid, integer-precision point | İran → Iran (32, 53), Humus → Homs Governorate |
+| `rejected` | unparseable, out of range, or outside the study region (lat 10–49.5, lon −10–60) | Kudüs → Kudus (Indonesia), Peçin → Pěčín (Czechia) |
+
+Informational flags (`name_mismatch`, `shared_coordinates`, `shared_wikidata`)
+do not block a point but are listed for review. Every delivered row and its
+verdict are kept in `gazetteer_entries` and served at `GET /api/v1/gazetteer`.
+A later delivery replaces the earlier verdict; a point that is no longer
+accepted is withdrawn from its place. Coordinates that came from appointment
+rows are never overwritten — disagreements are reported.
+
 Importer behaviour:
 
 - runs in **one transaction** (all-or-nothing) with an advisory lock so two
@@ -92,8 +119,16 @@ Importer behaviour:
   it never creates duplicates. If a row has no `doc_id`, a stable id is
   synthesized from the sheet name + row number (a warning is printed);
 - stores the **verbatim spreadsheet row** in `source_records.raw` (JSONB);
-- empty cells become SQL `NULL`; `-`, `yok`, `n/a`, … become `NULL` in the
-  normalized columns while the raw row keeps them;
+- empty cells become SQL `NULL`; `-`, `yok`, `n/a`, `ERROR`, … become `NULL` in
+  the normalized columns while the raw row keeps them;
+- `degree` / `position type` spelling variants are folded (`te’bid`, `te'bid`,
+  `teʻbid` → `tebid`; `maʻişet-i` → `maişet`); the raw row keeps the original;
+- a year outside 600–1350 (e.g. a whole document tagged `1556`) stays in
+  `year_original` but is not used for `year_numeric` filtering;
+- the same register entry transcribed in two documents (identical normalized
+  `text`, e.g. `AKR-84.docx` and `AKR-84 (1).docx`) is kept but marked
+  `duplicate_of`, and hidden from appointment lists, counts, flows and
+  journeys;
 - creates/links `persons` and `places`; recognises coordinate columns
   (`old_latitude/old_longitude`, `new_latitude/new_longitude`) and builds a
   PostGIS point via a trigger; places are still created when coordinates are
@@ -132,6 +167,7 @@ falls back to `http://127.0.0.1:8080/api/v1` (that needs
 | `GET /api/v1/appointments` | event list; filters: `person`, `place`, `origin_place`, `destination_place`, `year_from`, `year_to`, `degree`, `position_type`, `region`, `has_coordinates`, `source_record_id`, `limit`, `offset` |
 | `GET /api/v1/place-activity` | geocoded places with `arrivals` / `departures` under the `/flows` filters, for the map's place view; `limit` up to 5000 |
 | `GET /api/v1/flows` | `origin → destination → count` aggregation for a year window; `year_from`, `year_to`, `person`, `min_count`, `require_coordinates` (default `true`), `limit`, `offset` |
+| `GET /api/v1/gazetteer` | every delivered place → coordinate row with its verdict; `status` (`accepted` / `needs_review` / `rejected`), `issue` (e.g. `outside_study_region`), `query`, `limit`, `offset` |
 | `GET /api/v1/sources` | source records; `query` runs PostgreSQL full-text search over `source_text` and returns highlighted snippets + `rank` |
 | `GET /api/v1/sources/{id}` | one source record including the raw JSON row |
 

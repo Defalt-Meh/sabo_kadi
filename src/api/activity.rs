@@ -9,6 +9,7 @@ use sqlx::{Postgres, QueryBuilder};
 use super::{validate_year_range, Page, PageParams, Query};
 use crate::app::AppState;
 use crate::error::{ApiError, ApiResult};
+use crate::normalize::fold_term;
 
 /// Places are small rows and a map wants all of them at once, so this endpoint
 /// has its own, larger cap instead of the global page size.
@@ -134,10 +135,12 @@ fn apply_filters<'a>(qb: &mut QueryBuilder<'a, Postgres>, q: &'a ActivityQuery) 
     }
     if let Some(degree) = &q.degree {
         clause(qb);
-        qb.push("a.degree = ").push_bind(degree.as_str());
+        qb.push("a.degree = ")
+            .push_bind(fold_term(degree).unwrap_or_default());
     }
     if let Some(position) = &q.position_type {
         clause(qb);
-        qb.push("a.position_type = ").push_bind(position.as_str());
+        qb.push("a.position_type = ")
+            .push_bind(fold_term(position).unwrap_or_default());
     }
 }

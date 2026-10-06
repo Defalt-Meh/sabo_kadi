@@ -9,6 +9,8 @@ pub mod app;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod gazetteer;
+pub mod geo;
 pub mod importer;
 pub mod normalize;
 

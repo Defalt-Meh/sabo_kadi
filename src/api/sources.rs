@@ -144,7 +144,11 @@ pub struct SourceDetail {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     /// Appointment event(s) derived from this record (normally exactly one).
+    /// Empty when the record is a duplicate transcription.
     pub appointment_ids: Vec<i64>,
+    /// Set when this record transcribes the same register entry as another
+    /// source record; that record carries the appointment.
+    pub duplicate_of_source_record_id: Option<i64>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -179,6 +183,15 @@ pub async fn detail(
     .fetch_all(&state.pool)
     .await?;
 
+    let duplicate_of_source_record_id = sqlx::query_scalar::<_, i64>(
+        "SELECT k.source_record_id FROM appointment_records a \
+         JOIN appointment_records k ON k.id = a.duplicate_of \
+         WHERE a.source_record_id = $1 LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?;
+
     Ok(Json(SourceDetail {
         id: row.id,
         doc_id: row.doc_id,
@@ -189,5 +202,6 @@ pub async fn detail(
         created_at: row.created_at,
         updated_at: row.updated_at,
         appointment_ids,
+        duplicate_of_source_record_id,
     }))
 }
