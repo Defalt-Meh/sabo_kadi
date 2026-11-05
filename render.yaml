@@ -1,0 +1,14 @@
+# Render Blueprint — free web service built from ./Dockerfile.
+# The database lives on Neon (free, PostGIS included); paste its connection
+# string when Render asks for DATABASE_URL.
+services:
+  - type: web
+    name: kadi-atlas
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/v1/health
+    autoDeploy: true
+    envVars:
+      - key: DATABASE_URL
+        sync: false
