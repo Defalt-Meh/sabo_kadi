@@ -201,16 +201,33 @@ pub(crate) async fn import_sheet(
         }
     }
 
-    // ---- store ----
-    for e in &entries {
-        let issues: Vec<String> = e.assessment.issues.iter().map(|s| s.to_string()).collect();
-        let inserted: bool = sqlx::query_scalar(
+    // ---- store: one statement per chunk (issue lists travel comma-joined,
+    // since UNNEST cannot take a ragged text[][]) ----
+    for chunk in entries.chunks(1_000) {
+        let text = |f: fn(&Entry) -> Option<&str>| chunk.iter().map(f).collect::<Vec<_>>();
+        let issues: Vec<String> = chunk
+            .iter()
+            .map(|e| e.assessment.issues.join(","))
+            .collect();
+        let raw: Vec<String> = chunk.iter().map(|e| e.raw.to_string()).collect();
+        let lat: Vec<Option<f64>> = chunk.iter().map(|e| e.assessment.latitude).collect();
+        let lon: Vec<Option<f64>> = chunk.iter().map(|e| e.assessment.longitude).collect();
+        let row: Vec<i32> = chunk.iter().map(|e| e.excel_row as i32).collect();
+        let inserted: Vec<bool> = sqlx::query_scalar(
             r#"
             INSERT INTO gazetteer_entries (
                 normalized_name, original_name, matched_name, wikidata_qid, wikipedia_url, country,
                 raw_latitude, raw_longitude, latitude, longitude, coordinate_status, issues,
                 source_file, source_sheet, source_row, raw
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            )
+            SELECT k, o, m, q, w, c, rla, rlo, la, lo, st,
+                   COALESCE(string_to_array(NULLIF(i, ''), ','), '{}'),
+                   $13, $14, sr, r::jsonb
+              FROM UNNEST(
+                    $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
+                    $7::text[], $8::text[], $9::float8[], $10::float8[], $11::text[],
+                    $12::text[], $15::int4[], $16::text[]
+                   ) AS u(k, o, m, q, w, c, rla, rlo, la, lo, st, i, sr, r)
             ON CONFLICT (normalized_name) DO UPDATE SET
                 original_name     = EXCLUDED.original_name,
                 matched_name      = EXCLUDED.matched_name,
@@ -230,32 +247,38 @@ pub(crate) async fn import_sheet(
             RETURNING (xmax = 0)
             "#,
         )
-        .bind(&e.normalized_name)
-        .bind(&e.original_name)
-        .bind(e.matched_name.as_deref())
-        .bind(e.wikidata_qid.as_deref())
-        .bind(e.wikipedia_url.as_deref())
-        .bind(e.country.as_deref())
-        .bind(e.raw_latitude.as_deref())
-        .bind(e.raw_longitude.as_deref())
-        .bind(e.assessment.latitude)
-        .bind(e.assessment.longitude)
-        .bind(e.assessment.status.as_str())
+        .bind(text(|e| Some(e.normalized_name.as_str())))
+        .bind(text(|e| Some(e.original_name.as_str())))
+        .bind(text(|e| e.matched_name.as_deref()))
+        .bind(text(|e| e.wikidata_qid.as_deref()))
+        .bind(text(|e| e.wikipedia_url.as_deref()))
+        .bind(text(|e| e.country.as_deref()))
+        .bind(text(|e| e.raw_latitude.as_deref()))
+        .bind(text(|e| e.raw_longitude.as_deref()))
+        .bind(&lat)
+        .bind(&lon)
+        .bind(text(|e| Some(e.assessment.status.as_str())))
         .bind(&issues)
         .bind(source_file)
         .bind(sheet)
-        .bind(e.excel_row as i32)
-        .bind(sqlx::types::Json(&e.raw))
-        .fetch_one(&mut *tx)
+        .bind(&row)
+        .bind(&raw)
+        .fetch_all(&mut *tx)
         .await
-        .with_context(|| format!("{sheet} row {}: upsert gazetteer entry", e.excel_row))?;
+        .with_context(|| format!("{sheet}: upsert gazetteer entries"))?;
 
         let g = &mut report.gazetteer;
-        if inserted {
-            g.inserted += 1;
-        } else {
-            g.updated += 1;
+        for was_inserted in inserted {
+            if was_inserted {
+                g.inserted += 1;
+            } else {
+                g.updated += 1;
+            }
         }
+    }
+
+    for e in &entries {
+        let g = &mut report.gazetteer;
         match e.assessment.status {
             CoordinateStatus::Accepted => g.accepted += 1,
             CoordinateStatus::NeedsReview => g.needs_review += 1,

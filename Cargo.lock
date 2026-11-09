@@ -892,6 +892,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "http",
+ "log",
  "rust_xlsxwriter",
  "serde",
  "serde_json",

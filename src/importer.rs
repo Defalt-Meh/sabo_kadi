@@ -539,9 +539,6 @@ pub async fn import_path(pool: &PgPool, path: &Path, opts: &ImportOptions) -> Re
         .await
         .context("failed to take the import advisory lock")?;
 
-    let mut person_cache: HashMap<String, i64> = HashMap::new();
-    let mut place_cache: HashMap<String, PlaceCacheEntry> = HashMap::new();
-
     for (sheet_name, kind, mut headers, range) in sheets {
         report.sheets.push((sheet_name.clone(), kind));
         // 1-based Excel row numbers, header included
@@ -572,22 +569,8 @@ pub async fn import_path(pool: &PgPool, path: &Path, opts: &ImportOptions) -> Re
             }
             SheetKind::Appointments => {
                 appointment_header_warnings(&headers, &sheet_name, &mut report.warnings);
-                for (excel_row, row) in rows {
-                    report.rows_total += 1;
-                    import_row(
-                        &mut tx,
-                        &headers,
-                        row,
-                        excel_row,
-                        &sheet_name,
-                        &mut person_cache,
-                        &mut place_cache,
-                        &mut report,
-                    )
-                    .await
-                    .with_context(|| format!("{sheet_name} row {excel_row}: failed to import"))?;
-                    report.rows_imported += 1;
-                }
+                import_appointment_sheet(&mut tx, &headers, &rows, &sheet_name, &mut report)
+                    .await?;
             }
         }
     }
@@ -679,27 +662,91 @@ async fn coverage(tx: &mut PgConnection) -> Result<Coverage> {
     })
 }
 
-#[derive(Clone, Copy)]
-struct PlaceCacheEntry {
-    id: i64,
-    has_coords: bool,
+// ---------------------------------------------------------------------------
+// Appointment sheets — bulk path
+//
+// The sheet is parsed in memory first; the database then sees a handful of
+// set-based statements (`UNNEST` over parallel arrays) per `CHUNK` rows instead
+// of ~6 round trips per row. Against a remote database (Neon) that is the
+// difference between hours and seconds. Semantics match the per-row importer
+// it replaced: first spelling of a name becomes its canonical form, first
+// valid coordinates fill an empty place, a repeated doc_id lets the later row
+// win.
+// ---------------------------------------------------------------------------
+
+/// Rows per bulk statement.
+const CHUNK: usize = 200;
+
+struct ParsedRow {
+    doc_id: String,
+    varak_no: Option<String>,
+    certificate: Option<String>,
+    source_text: Option<String>,
+    text_key: Option<String>,
+    raw: String,
+    raw_old_kadi: Option<String>,
+    raw_new_kadi: Option<String>,
+    raw_old_place: Option<String>,
+    raw_new_place: Option<String>,
+    old_person: Option<String>,
+    new_person: Option<String>,
+    origin: Option<String>,
+    destination: Option<String>,
+    year_original: Option<String>,
+    year_numeric: Option<i32>,
+    degree: Option<String>,
+    position_type: Option<String>,
+    period: Option<String>,
+    salary: Option<String>,
+    old_salary: Option<String>,
+    asitane: Option<String>,
+    infisal: Option<String>,
+    region: Option<String>,
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn import_row(
-    tx: &mut PgConnection,
+/// Distinct names in first-seen order: normalized key -> (canonical, coords).
+#[derive(Default)]
+struct NameSet {
+    keys: Vec<String>,
+    canonical: Vec<String>,
+    lat: Vec<Option<f64>>,
+    lon: Vec<Option<f64>>,
+    index: HashMap<String, usize>,
+}
+
+impl NameSet {
+    /// Register a raw mention; returns its normalized key.
+    fn add(&mut self, raw: Option<&str>, coords: (Option<f64>, Option<f64>)) -> Option<String> {
+        let raw = raw?;
+        let key = normalize_key(raw)?;
+        match self.index.get(&key) {
+            Some(&i) => {
+                if self.lat[i].is_none() && coords.0.is_some() {
+                    self.lat[i] = coords.0;
+                    self.lon[i] = coords.1;
+                }
+            }
+            None => {
+                self.index.insert(key.clone(), self.keys.len());
+                self.keys.push(key.clone());
+                self.canonical.push(raw.trim().to_string());
+                self.lat.push(coords.0);
+                self.lon.push(coords.1);
+            }
+        }
+        Some(key)
+    }
+}
+
+fn parse_row(
     headers: &HeaderMap,
     row: &[Data],
     excel_row: usize,
     sheet_name: &str,
-    person_cache: &mut HashMap<String, i64>,
-    place_cache: &mut HashMap<String, PlaceCacheEntry>,
+    persons: &mut NameSet,
+    places: &mut NameSet,
     report: &mut ImportReport,
-) -> Result<()> {
-    // ---- verbatim raw row ----
-    let raw = headers.raw_json(row);
-
-    // ---- source identity ----
+) -> ParsedRow {
     let doc_id = match headers.clean_str(row, "doc_id") {
         Some(id) => id,
         None => {
@@ -711,52 +758,17 @@ async fn import_row(
         }
     };
 
-    let varak_no = headers.clean_str(row, "varak_no");
-    let certificate = headers.clean_str(row, "certificate");
     let source_text = headers.clean_str(row, "text");
     let text_key = source_text
         .as_deref()
         .and_then(normalize_key)
         .filter(|k| k.chars().count() >= MIN_FINGERPRINT_CHARS);
 
-    let src: (i64, bool) = sqlx::query_as(
-        r#"
-        INSERT INTO source_records (doc_id, varak_no, certificate, source_text, raw, text_fingerprint)
-        VALUES ($1, $2, $3, $4, $5, md5($6))
-        ON CONFLICT (doc_id) DO UPDATE SET
-            varak_no         = EXCLUDED.varak_no,
-            certificate      = EXCLUDED.certificate,
-            source_text      = EXCLUDED.source_text,
-            raw              = EXCLUDED.raw,
-            text_fingerprint = EXCLUDED.text_fingerprint
-        RETURNING id, (xmax = 0) AS inserted
-        "#,
-    )
-    .bind(doc_id.as_str())
-    .bind(varak_no.as_deref())
-    .bind(certificate.as_deref())
-    .bind(source_text.as_deref())
-    .bind(sqlx::types::Json(&raw))
-    .bind(text_key.as_deref())
-    .fetch_one(&mut *tx)
-    .await
-    .context("upsert source_records")?;
-    let (source_record_id, source_inserted) = src;
-    if source_inserted {
-        report.source_records_inserted += 1;
-    } else {
-        report.source_records_updated += 1;
-    }
-
-    // ---- persons ----
     let raw_old_kadi = headers.raw_str(row, "old_kadi");
     let raw_new_kadi = headers.raw_str(row, "new_kadi");
-    let old_person_id =
-        resolve_person(&mut *tx, raw_old_kadi.as_deref(), person_cache, report).await?;
-    let new_person_id =
-        resolve_person(&mut *tx, raw_new_kadi.as_deref(), person_cache, report).await?;
+    let old_person = persons.add(raw_old_kadi.as_deref(), (None, None));
+    let new_person = persons.add(raw_new_kadi.as_deref(), (None, None));
 
-    // ---- places (+ optional coordinates) ----
     let raw_old_place = headers.raw_str(row, "old_place");
     let raw_new_place = headers.raw_str(row, "new_place");
     for cell in [&raw_old_place, &raw_new_place].into_iter().flatten() {
@@ -764,7 +776,7 @@ async fn import_row(
             report.place_cells_error += 1;
         }
     }
-    let (old_lat, old_lon) = read_coords(
+    let old_coords = read_coords(
         headers,
         row,
         "old_latitude",
@@ -773,7 +785,7 @@ async fn import_row(
         "origin",
         report,
     );
-    let (new_lat, new_lon) = read_coords(
+    let new_coords = read_coords(
         headers,
         row,
         "new_latitude",
@@ -782,25 +794,8 @@ async fn import_row(
         "destination",
         report,
     );
-
-    let origin_place_id = resolve_place(
-        &mut *tx,
-        raw_old_place.as_deref(),
-        old_lat,
-        old_lon,
-        place_cache,
-        report,
-    )
-    .await?;
-    let destination_place_id = resolve_place(
-        &mut *tx,
-        raw_new_place.as_deref(),
-        new_lat,
-        new_lon,
-        place_cache,
-        report,
-    )
-    .await?;
+    let origin = places.add(raw_old_place.as_deref(), old_coords);
+    let destination = places.add(raw_new_place.as_deref(), new_coords);
 
     // ---- date (never guess the calendar) ----
     let year_original = headers.raw_str(row, "tarih");
@@ -815,20 +810,300 @@ async fn import_row(
         other => other,
     };
 
-    // ---- appointment event ----
-    let appt: (i64, bool) = sqlx::query_as(
+    ParsedRow {
+        doc_id,
+        varak_no: headers.clean_str(row, "varak_no"),
+        certificate: headers.clean_str(row, "certificate"),
+        source_text,
+        text_key,
+        raw: headers.raw_json(row).to_string(),
+        raw_old_kadi,
+        raw_new_kadi,
+        raw_old_place,
+        raw_new_place,
+        old_person,
+        new_person,
+        origin,
+        destination,
+        year_original,
+        year_numeric,
+        degree: headers.raw_str(row, "degree").and_then(|s| fold_term(&s)),
+        position_type: headers
+            .raw_str(row, "position_type")
+            .and_then(|s| fold_term(&s)),
+        period: headers.clean_str(row, "period"),
+        salary: headers.clean_str(row, "salary"),
+        old_salary: headers.clean_str(row, "old_salary"),
+        asitane: headers.clean_str(row, "asitane"),
+        infisal: headers.clean_str(row, "infisal"),
+        region: headers.clean_str(row, "region"),
+    }
+}
+
+async fn import_appointment_sheet(
+    tx: &mut PgConnection,
+    headers: &HeaderMap,
+    rows: &[(usize, &[Data])],
+    sheet_name: &str,
+    report: &mut ImportReport,
+) -> Result<()> {
+    // ---- parse everything first ----
+    let mut persons = NameSet::default();
+    let mut places = NameSet::default();
+    let mut parsed: Vec<ParsedRow> = Vec::with_capacity(rows.len());
+    let mut by_doc: HashMap<String, (usize, usize)> = HashMap::new();
+    for &(excel_row, row) in rows {
+        report.rows_total += 1;
+        let p = parse_row(
+            headers,
+            row,
+            excel_row,
+            sheet_name,
+            &mut persons,
+            &mut places,
+            report,
+        );
+        // a repeated doc_id: the later row wins, as a re-import would
+        if let Some(&(i, first_row)) = by_doc.get(&p.doc_id) {
+            report.warnings.push(format!(
+                "{sheet_name} row {excel_row}: doc_id `{}` repeats row {first_row}; the later row wins",
+                p.doc_id
+            ));
+            parsed[i] = p;
+            by_doc.insert(parsed[i].doc_id.clone(), (i, excel_row));
+        } else {
+            by_doc.insert(p.doc_id.clone(), (parsed.len(), excel_row));
+            parsed.push(p);
+        }
+        report.rows_imported += 1;
+    }
+
+    let person_ids = upsert_persons(tx, &persons, report).await?;
+    let place_ids = upsert_places(tx, &places, report).await?;
+
+    // ---- source records + appointments, chunk by chunk ----
+    let total = parsed.len();
+    for (n, chunk) in parsed.chunks(CHUNK).enumerate() {
+        let source_ids = upsert_source_chunk(tx, chunk, report)
+            .await
+            .with_context(|| format!("{sheet_name}: source records, chunk {}", n + 1))?;
+        upsert_appointment_chunk(tx, chunk, &source_ids, &person_ids, &place_ids, report)
+            .await
+            .with_context(|| format!("{sheet_name}: appointments, chunk {}", n + 1))?;
+        eprintln!(
+            "  {sheet_name}: {} / {total} rows",
+            (n * CHUNK + chunk.len())
+        );
+    }
+    Ok(())
+}
+
+async fn upsert_persons(
+    tx: &mut PgConnection,
+    persons: &NameSet,
+    report: &mut ImportReport,
+) -> Result<HashMap<String, i64>> {
+    let mut ids = HashMap::with_capacity(persons.keys.len());
+    for (keys, canonical) in persons
+        .keys
+        .chunks(CHUNK)
+        .zip(persons.canonical.chunks(CHUNK))
+    {
+        report.persons_created += sqlx::query(
+            "INSERT INTO persons (canonical_name, normalized_name) \
+             SELECT * FROM UNNEST($1::text[], $2::text[]) \
+             ON CONFLICT (normalized_name) DO NOTHING",
+        )
+        .bind(canonical)
+        .bind(keys)
+        .execute(&mut *tx)
+        .await
+        .context("insert persons")?
+        .rows_affected();
+
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT normalized_name, id FROM persons WHERE normalized_name = ANY($1::text[])",
+        )
+        .bind(keys)
+        .fetch_all(&mut *tx)
+        .await
+        .context("look up persons")?;
+        ids.extend(rows);
+    }
+    Ok(ids)
+}
+
+async fn upsert_places(
+    tx: &mut PgConnection,
+    places: &NameSet,
+    report: &mut ImportReport,
+) -> Result<HashMap<String, i64>> {
+    let mut ids = HashMap::with_capacity(places.keys.len());
+    let n = places.keys.len();
+    for start in (0..n).step_by(CHUNK) {
+        let end = (start + CHUNK).min(n);
+        let (keys, canonical) = (&places.keys[start..end], &places.canonical[start..end]);
+        let (lat, lon) = (&places.lat[start..end], &places.lon[start..end]);
+
+        // new places, with their first valid coordinates
+        let created: Vec<bool> = sqlx::query_scalar(
+            "INSERT INTO places (canonical_name, normalized_name, latitude, longitude, coordinate_source) \
+             SELECT c, k, la, lo, CASE WHEN la IS NOT NULL THEN 'source_row' END \
+               FROM UNNEST($1::text[], $2::text[], $3::float8[], $4::float8[]) AS u(c, k, la, lo) \
+             ON CONFLICT (normalized_name) DO NOTHING \
+             RETURNING latitude IS NOT NULL",
+        )
+        .bind(canonical)
+        .bind(keys)
+        .bind(lat)
+        .bind(lon)
+        .fetch_all(&mut *tx)
+        .await
+        .context("insert places")?;
+        report.places_created += created.len() as u64;
+        report.place_coordinates_set += created.iter().filter(|c| **c).count() as u64;
+
+        // existing places without coordinates get the first valid pair;
+        // existing coordinates are never overwritten
+        report.place_coordinates_set += sqlx::query(
+            "UPDATE places p \
+                SET latitude = u.la, longitude = u.lo, coordinate_source = 'source_row' \
+               FROM UNNEST($1::text[], $2::float8[], $3::float8[]) AS u(k, la, lo) \
+              WHERE p.normalized_name = u.k AND u.la IS NOT NULL \
+                AND p.latitude IS NULL AND p.longitude IS NULL",
+        )
+        .bind(keys)
+        .bind(lat)
+        .bind(lon)
+        .execute(&mut *tx)
+        .await
+        .context("fill place coordinates")?
+        .rows_affected();
+
+        // the name as attested by this source (minimal place_names row;
+        // researcher-curated history with validity ranges is added later)
+        sqlx::query(
+            "INSERT INTO place_names (place_id, name, normalized_name, calendar) \
+             SELECT p.id, u.name, u.k, 'unknown' \
+               FROM UNNEST($1::text[], $2::text[]) AS u(name, k) \
+               JOIN places p ON p.normalized_name = u.k \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(canonical)
+        .bind(keys)
+        .execute(&mut *tx)
+        .await
+        .context("record attested place names")?;
+
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT normalized_name, id FROM places WHERE normalized_name = ANY($1::text[])",
+        )
+        .bind(keys)
+        .fetch_all(&mut *tx)
+        .await
+        .context("look up places")?;
+        ids.extend(rows);
+    }
+    Ok(ids)
+}
+
+/// Upsert one chunk of source records; returns doc_id -> id.
+async fn upsert_source_chunk(
+    tx: &mut PgConnection,
+    chunk: &[ParsedRow],
+    report: &mut ImportReport,
+) -> Result<HashMap<String, i64>> {
+    let col = |f: fn(&ParsedRow) -> Option<&str>| chunk.iter().map(f).collect::<Vec<_>>();
+    let rows: Vec<(String, i64, bool)> = sqlx::query_as(
+        r#"
+        INSERT INTO source_records (doc_id, varak_no, certificate, source_text, raw, text_fingerprint)
+        SELECT d, v, c, t, r::jsonb, md5(f)
+          FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[])
+               AS u(d, v, c, t, r, f)
+        ON CONFLICT (doc_id) DO UPDATE SET
+            varak_no         = EXCLUDED.varak_no,
+            certificate      = EXCLUDED.certificate,
+            source_text      = EXCLUDED.source_text,
+            raw              = EXCLUDED.raw,
+            text_fingerprint = EXCLUDED.text_fingerprint
+        RETURNING doc_id, id, (xmax = 0) AS inserted
+        "#,
+    )
+    .bind(col(|r| Some(r.doc_id.as_str())))
+    .bind(col(|r| r.varak_no.as_deref()))
+    .bind(col(|r| r.certificate.as_deref()))
+    .bind(col(|r| r.source_text.as_deref()))
+    .bind(col(|r| Some(r.raw.as_str())))
+    .bind(col(|r| r.text_key.as_deref()))
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let mut ids = HashMap::with_capacity(rows.len());
+    for (doc_id, id, inserted) in rows {
+        if inserted {
+            report.source_records_inserted += 1;
+        } else {
+            report.source_records_updated += 1;
+        }
+        ids.insert(doc_id, id);
+    }
+    Ok(ids)
+}
+
+async fn upsert_appointment_chunk(
+    tx: &mut PgConnection,
+    chunk: &[ParsedRow],
+    source_ids: &HashMap<String, i64>,
+    person_ids: &HashMap<String, i64>,
+    place_ids: &HashMap<String, i64>,
+    report: &mut ImportReport,
+) -> Result<()> {
+    let id_of = |map: &HashMap<String, i64>, key: &Option<String>| -> Option<i64> {
+        key.as_ref().and_then(|k| map.get(k).copied())
+    };
+    let text = |f: fn(&ParsedRow) -> Option<&str>| chunk.iter().map(f).collect::<Vec<_>>();
+    let source: Vec<i64> = chunk
+        .iter()
+        .map(|r| {
+            source_ids
+                .get(&r.doc_id)
+                .copied()
+                .with_context(|| format!("no source record id for `{}`", r.doc_id))
+        })
+        .collect::<Result<_>>()?;
+    let old_person: Vec<Option<i64>> = chunk
+        .iter()
+        .map(|r| id_of(person_ids, &r.old_person))
+        .collect();
+    let new_person: Vec<Option<i64>> = chunk
+        .iter()
+        .map(|r| id_of(person_ids, &r.new_person))
+        .collect();
+    let origin: Vec<Option<i64>> = chunk.iter().map(|r| id_of(place_ids, &r.origin)).collect();
+    let destination: Vec<Option<i64>> = chunk
+        .iter()
+        .map(|r| id_of(place_ids, &r.destination))
+        .collect();
+    let year_numeric: Vec<Option<i32>> = chunk.iter().map(|r| r.year_numeric).collect();
+
+    let inserted: Vec<bool> = sqlx::query_scalar(
         r#"
         INSERT INTO appointment_records (
             source_record_id, old_person_id, new_person_id, origin_place_id, destination_place_id,
             raw_old_kadi, raw_new_kadi, raw_old_place, raw_new_place,
             year_original, year_numeric, calendar,
             degree, position_type, period, salary, old_salary, asitane, infisal, region_raw
-        ) VALUES (
-            $1, $2, $3, $4, $5,
-            $6, $7, $8, $9,
-            $10, $11, 'unknown',
-            $12, $13, $14, $15, $16, $17, $18, $19
         )
+        SELECT s, op, np, o, d, rok, rnk, rop, rnp, yo, yn, 'unknown',
+               deg, pt, per, sal, osal, asi, inf, reg
+          FROM UNNEST(
+                $1::int8[], $2::int8[], $3::int8[], $4::int8[], $5::int8[],
+                $6::text[], $7::text[], $8::text[], $9::text[],
+                $10::text[], $11::int4[],
+                $12::text[], $13::text[], $14::text[], $15::text[], $16::text[],
+                $17::text[], $18::text[], $19::text[]
+               ) AS u(s, op, np, o, d, rok, rnk, rop, rnp, yo, yn,
+                      deg, pt, per, sal, osal, asi, inf, reg)
         ON CONFLICT (source_record_id) DO UPDATE SET
             old_person_id        = EXCLUDED.old_person_id,
             new_person_id        = EXCLUDED.new_person_id,
@@ -848,41 +1123,38 @@ async fn import_row(
             asitane              = EXCLUDED.asitane,
             infisal              = EXCLUDED.infisal,
             region_raw           = EXCLUDED.region_raw
-        RETURNING id, (xmax = 0) AS inserted
+        RETURNING (xmax = 0)
         "#,
     )
-    .bind(source_record_id)
-    .bind(old_person_id)
-    .bind(new_person_id)
-    .bind(origin_place_id)
-    .bind(destination_place_id)
-    .bind(raw_old_kadi.as_deref())
-    .bind(raw_new_kadi.as_deref())
-    .bind(raw_old_place.as_deref())
-    .bind(raw_new_place.as_deref())
-    .bind(year_original.as_deref())
-    .bind(year_numeric)
-    .bind(headers.raw_str(row, "degree").and_then(|s| fold_term(&s)))
-    .bind(
-        headers
-            .raw_str(row, "position_type")
-            .and_then(|s| fold_term(&s)),
-    )
-    .bind(headers.clean_str(row, "period"))
-    .bind(headers.clean_str(row, "salary"))
-    .bind(headers.clean_str(row, "old_salary"))
-    .bind(headers.clean_str(row, "asitane"))
-    .bind(headers.clean_str(row, "infisal"))
-    .bind(headers.clean_str(row, "region"))
-    .fetch_one(&mut *tx)
-    .await
-    .context("upsert appointments")?;
-    if appt.1 {
-        report.appointments_inserted += 1;
-    } else {
-        report.appointments_updated += 1;
-    }
+    .bind(&source)
+    .bind(&old_person)
+    .bind(&new_person)
+    .bind(&origin)
+    .bind(&destination)
+    .bind(text(|r| r.raw_old_kadi.as_deref()))
+    .bind(text(|r| r.raw_new_kadi.as_deref()))
+    .bind(text(|r| r.raw_old_place.as_deref()))
+    .bind(text(|r| r.raw_new_place.as_deref()))
+    .bind(text(|r| r.year_original.as_deref()))
+    .bind(&year_numeric)
+    .bind(text(|r| r.degree.as_deref()))
+    .bind(text(|r| r.position_type.as_deref()))
+    .bind(text(|r| r.period.as_deref()))
+    .bind(text(|r| r.salary.as_deref()))
+    .bind(text(|r| r.old_salary.as_deref()))
+    .bind(text(|r| r.asitane.as_deref()))
+    .bind(text(|r| r.infisal.as_deref()))
+    .bind(text(|r| r.region.as_deref()))
+    .fetch_all(&mut *tx)
+    .await?;
 
+    for i in inserted {
+        if i {
+            report.appointments_inserted += 1;
+        } else {
+            report.appointments_updated += 1;
+        }
+    }
     Ok(())
 }
 
@@ -913,153 +1185,6 @@ fn read_coords(
             (None, None)
         }
     }
-}
-
-async fn resolve_person(
-    tx: &mut PgConnection,
-    raw: Option<&str>,
-    cache: &mut HashMap<String, i64>,
-    report: &mut ImportReport,
-) -> Result<Option<i64>> {
-    let Some(raw) = raw else { return Ok(None) };
-    let Some(norm) = normalize_key(raw) else {
-        return Ok(None);
-    };
-    if let Some(id) = cache.get(&norm) {
-        return Ok(Some(*id));
-    }
-
-    let (id, created): (i64, bool) = sqlx::query_as(
-        r#"
-        WITH ins AS (
-            INSERT INTO persons (canonical_name, normalized_name)
-            VALUES ($1, $2)
-            ON CONFLICT (normalized_name) DO NOTHING
-            RETURNING id
-        )
-        SELECT id, true  FROM ins
-        UNION ALL
-        SELECT id, false FROM persons
-         WHERE normalized_name = $2 AND NOT EXISTS (SELECT 1 FROM ins)
-        "#,
-    )
-    .bind(raw.trim())
-    .bind(norm.as_str())
-    .fetch_one(&mut *tx)
-    .await
-    .context("resolve person")?;
-
-    if created {
-        report.persons_created += 1;
-    }
-    cache.insert(norm, id);
-    Ok(Some(id))
-}
-
-async fn resolve_place(
-    tx: &mut PgConnection,
-    raw: Option<&str>,
-    lat: Option<f64>,
-    lon: Option<f64>,
-    cache: &mut HashMap<String, PlaceCacheEntry>,
-    report: &mut ImportReport,
-) -> Result<Option<i64>> {
-    let Some(raw) = raw else { return Ok(None) };
-    let Some(norm) = normalize_key(raw) else {
-        return Ok(None);
-    };
-    let has_new_coords = lat.is_some() && lon.is_some();
-
-    if let Some(entry) = cache.get(&norm).copied() {
-        if has_new_coords && !entry.has_coords {
-            let filled = fill_place_coords(&mut *tx, entry.id, lat, lon).await?;
-            if filled {
-                report.place_coordinates_set += 1;
-                cache.insert(
-                    norm,
-                    PlaceCacheEntry {
-                        id: entry.id,
-                        has_coords: true,
-                    },
-                );
-            }
-        }
-        return Ok(Some(entry.id));
-    }
-
-    let (id, created): (i64, bool) = sqlx::query_as(
-        r#"
-        WITH ins AS (
-            INSERT INTO places (canonical_name, normalized_name, latitude, longitude, coordinate_source)
-            VALUES ($1, $2, $3, $4, CASE WHEN $3::float8 IS NOT NULL THEN 'source_row' END)
-            ON CONFLICT (normalized_name) DO NOTHING
-            RETURNING id
-        )
-        SELECT id, true  FROM ins
-        UNION ALL
-        SELECT id, false FROM places
-         WHERE normalized_name = $2 AND NOT EXISTS (SELECT 1 FROM ins)
-        "#,
-    )
-    .bind(raw.trim())
-    .bind(norm.as_str())
-    .bind(lat)
-    .bind(lon)
-    .fetch_one(&mut *tx)
-    .await
-    .context("resolve place")?;
-
-    let mut has_coords = created && has_new_coords;
-    if created {
-        report.places_created += 1;
-        if has_new_coords {
-            report.place_coordinates_set += 1;
-        }
-    } else if has_new_coords {
-        let filled = fill_place_coords(&mut *tx, id, lat, lon).await?;
-        if filled {
-            report.place_coordinates_set += 1;
-            has_coords = true;
-        }
-    }
-
-    // Record the name as attested by this source (minimal place_names row;
-    // researcher-curated history with validity ranges is added later).
-    sqlx::query(
-        "INSERT INTO place_names (place_id, name, normalized_name, calendar) \
-         VALUES ($1, $2, $3, 'unknown') ON CONFLICT DO NOTHING",
-    )
-    .bind(id)
-    .bind(raw.trim())
-    .bind(norm.as_str())
-    .execute(&mut *tx)
-    .await
-    .context("record attested place name")?;
-
-    cache.insert(norm, PlaceCacheEntry { id, has_coords });
-    Ok(Some(id))
-}
-
-/// Fill coordinates only when the place currently has none. Existing coordinates
-/// are never overwritten silently. Returns whether a row was updated.
-async fn fill_place_coords(
-    tx: &mut PgConnection,
-    id: i64,
-    lat: Option<f64>,
-    lon: Option<f64>,
-) -> Result<bool> {
-    let updated = sqlx::query_scalar::<_, i64>(
-        "UPDATE places SET latitude = $2, longitude = $3, coordinate_source = 'source_row' \
-         WHERE id = $1 AND latitude IS NULL AND longitude IS NULL \
-         RETURNING id",
-    )
-    .bind(id)
-    .bind(lat)
-    .bind(lon)
-    .fetch_optional(&mut *tx)
-    .await
-    .context("fill place coordinates")?;
-    Ok(updated.is_some())
 }
 
 // ---------------------------------------------------------------------------

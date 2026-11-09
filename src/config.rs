@@ -22,7 +22,9 @@ pub struct Config {
     pub database_max_connections: u32,
     /// How long to wait for a free connection before erroring.
     pub database_acquire_timeout: Duration,
-    /// Address the HTTP server binds to.
+    /// Address the HTTP server binds to. `KADI_ATLAS__BIND_ADDR` wins; else a
+    /// platform-provided `PORT` (Render, Heroku-style hosts) means
+    /// `0.0.0.0:$PORT`; else `127.0.0.1:8080`.
     pub bind_addr: SocketAddr,
     /// Default page size when a request omits `limit`.
     pub default_page_size: i64,
@@ -69,10 +71,16 @@ impl Config {
         let database_acquire_timeout =
             Duration::from_secs(parse_var(&lookup, "DATABASE_ACQUIRE_TIMEOUT_SECS", 10u64)?);
 
-        let bind_addr: SocketAddr = var(&lookup, "BIND_ADDR")
-            .unwrap_or_else(|| "127.0.0.1:8080".to_string())
-            .parse()
-            .context("KADI_ATLAS__BIND_ADDR must be a valid socket address, e.g. 127.0.0.1:8080")?;
+        let bind_addr: SocketAddr = match (var(&lookup, "BIND_ADDR"), lookup("PORT")) {
+            (Some(addr), _) => addr.parse().context(
+                "KADI_ATLAS__BIND_ADDR must be a valid socket address, e.g. 127.0.0.1:8080",
+            )?,
+            (None, Some(port)) if !port.is_empty() => {
+                let port: u16 = port.parse().context("PORT must be a TCP port number")?;
+                SocketAddr::from(([0, 0, 0, 0], port))
+            }
+            (None, _) => SocketAddr::from(([127, 0, 0, 1], 8080)),
+        };
 
         let default_page_size = parse_var(&lookup, "DEFAULT_PAGE_SIZE", 50i64)?;
         let max_page_size = parse_var(&lookup, "MAX_PAGE_SIZE", 200i64)?;
@@ -85,7 +93,8 @@ impl Config {
             ));
         }
 
-        let request_timeout = Duration::from_secs(parse_var(&lookup, "REQUEST_TIMEOUT_SECS", 30u64)?);
+        let request_timeout =
+            Duration::from_secs(parse_var(&lookup, "REQUEST_TIMEOUT_SECS", 30u64)?);
         let auto_migrate = parse_bool_var(&lookup, "AUTO_MIGRATE", true)?;
 
         let log_format = match var(&lookup, "LOG_FORMAT").as_deref() {
@@ -233,7 +242,26 @@ mod tests {
         assert_eq!(cfg.max_page_size, 5);
         assert_eq!(cfg.request_timeout, Duration::from_secs(2));
         assert_eq!(cfg.log_format, LogFormat::Json);
-        assert_eq!(cfg.cors_allow_origin.as_deref(), Some("https://example.org"));
+        assert_eq!(
+            cfg.cors_allow_origin.as_deref(),
+            Some("https://example.org")
+        );
+    }
+
+    #[test]
+    fn platform_port_binds_all_interfaces_unless_bind_addr_is_set() {
+        let cfg = load(&[DB, ("PORT", "10000")]).unwrap();
+        assert_eq!(cfg.bind_addr, "0.0.0.0:10000".parse().unwrap());
+
+        let cfg = load(&[
+            DB,
+            ("PORT", "10000"),
+            ("KADI_ATLAS__BIND_ADDR", "127.0.0.1:9000"),
+        ])
+        .unwrap();
+        assert_eq!(cfg.bind_addr, "127.0.0.1:9000".parse().unwrap());
+
+        assert!(err(&[DB, ("PORT", "http")]).contains("PORT must be a TCP port"));
     }
 
     #[test]
@@ -277,8 +305,10 @@ mod tests {
     #[test]
     fn web_dir_must_contain_index_html() {
         let missing = std::env::temp_dir().join("kadi-atlas-config-test-does-not-exist");
-        assert!(err(&[DB, ("KADI_ATLAS__WEB_DIR", missing.to_str().unwrap())])
-            .contains("must be a directory containing index.html"));
+        assert!(
+            err(&[DB, ("KADI_ATLAS__WEB_DIR", missing.to_str().unwrap())])
+                .contains("must be a directory containing index.html")
+        );
 
         let web = concat!(env!("CARGO_MANIFEST_DIR"), "/web");
         let cfg = load(&[DB, ("KADI_ATLAS__WEB_DIR", web)]).unwrap();

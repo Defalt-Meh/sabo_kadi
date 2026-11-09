@@ -16,5 +16,8 @@
 !/data/build/.gitkeep
 /data
 
+# Real workbooks must never be committed (public repo)
+/deploy/seed/*.xlsx
+
 # Editor / OS
 .DS_Store

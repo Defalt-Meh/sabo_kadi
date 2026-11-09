@@ -44,6 +44,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
 thiserror = "2"
 anyhow = "1"
+log = "0.4"
 dotenvy = "0.15"
 serde_urlencoded = "0.7"
 
