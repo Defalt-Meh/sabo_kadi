@@ -675,7 +675,7 @@ async function refreshMap({ fit = false, quiet = false } = {}) {
       const { items, total } = await getFlows({ ...filters, limit: FLOW_LIMIT }, { signal: controller.signal });
       if (request !== state.mapRequest) return;
 
-      map.setFlows(items, { fit });
+      map.setFlows(items, { fit, time: fadeWindow() });
       state.lastCount = { kind: "flows", shown: items.length, total };
     } else {
       const { items, total } = await getPlaceActivity(filters, { signal: controller.signal });
@@ -719,6 +719,16 @@ function emptyReason() {
   }
 
   return { title: t("map.emptyTitle"), text: t("map.noGeoText") };
+}
+
+// The years flow arrows are aged against: older arrows fade as the timeline
+// cursor moves forward. Open ends fall back to the corpus' first/last year.
+function fadeWindow() {
+  const { from, to } = effectiveWindow();
+  return {
+    from: from ?? state.meta?.min_year ?? null,
+    to: to ?? state.meta?.max_year ?? null
+  };
 }
 
 function routeWindow() {
@@ -813,12 +823,15 @@ function renderLegend() {
       el("div", {}, t("route.first"), ramp, t("route.last")),
       el("div", {}, el("span", { class: "legend-number", "aria-hidden": "true" }, "1"), t("map.legendOrder"))
     );
+    // route arrows only fade while the timeline is narrowed
+    if (!isFullRange()) legend.append(legendAge());
     return;
   }
 
   if (state.mapMode === "flows") {
     legend.append(
       el("div", {}, el("span", { class: "legend-line", "aria-hidden": "true" }), t("map.legendFlow")),
+      legendAge(),
       el("div", {}, el("span", { class: "legend-node", "aria-hidden": "true" }), t("common.place"))
     );
   } else {
@@ -828,6 +841,10 @@ function renderLegend() {
         t("map.legendPoints"))
     );
   }
+}
+
+function legendAge() {
+  return el("div", {}, el("span", { class: "legend-line is-faded", "aria-hidden": "true" }), t("map.legendAge"));
 }
 
 // Only show the overlay for slow requests, so quick updates don't flicker.

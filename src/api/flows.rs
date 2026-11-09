@@ -46,6 +46,9 @@ pub struct Flow {
     pub origin: PlaceRef,
     pub destination: PlaceRef,
     pub count: i64,
+    /// Latest dated appointment on this flow (within the filters); `None` when
+    /// none of its appointments has a numeric year. The map fades old flows.
+    pub last_year: Option<i32>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -59,6 +62,7 @@ struct Row {
     dest_lat: Option<f64>,
     dest_lon: Option<f64>,
     count: i64,
+    last_year: Option<i32>,
 }
 
 const FROM: &str = r#"
@@ -98,7 +102,7 @@ pub async fn list(
          o.latitude AS origin_lat, o.longitude AS origin_lon, \
          d.id AS dest_id, d.canonical_name AS dest_name, \
          d.latitude AS dest_lat, d.longitude AS dest_lon, \
-         count(*) AS count {FROM}"
+         count(*) AS count, max(a.year_numeric) AS last_year {FROM}"
     ));
     apply_filters(&mut qb, &q, require_coords);
     qb.push(group_by).push_bind(min_count);
@@ -124,6 +128,7 @@ pub async fn list(
                 longitude: r.dest_lon,
             },
             count: r.count,
+            last_year: r.last_year,
         })
         .collect();
 

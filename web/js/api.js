@@ -349,7 +349,8 @@ function normalizeFlow(flow) {
     destination: flow?.destination?.canonical_name ?? "",
     destination_latitude: numberOrNull(flow?.destination?.latitude),
     destination_longitude: numberOrNull(flow?.destination?.longitude),
-    count: Number(flow?.count ?? 0)
+    count: Number(flow?.count ?? 0),
+    last_year: numberOrNull(flow?.last_year)
   };
 }
 

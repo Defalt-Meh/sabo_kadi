@@ -441,6 +441,13 @@ async fn flow_aggregation_counts_and_coordinates() {
     );
     assert_eq!(geocoded["origin"]["latitude"], 41.0);
     assert_eq!(geocoded["destination"]["longitude"], 27.1);
+    assert_eq!(geocoded["last_year"], 1142, "latest year on the flow");
+
+    // last_year respects the year window (the map ages arrows against it)
+    let (_s, body) = get(&app, "/api/v1/flows?year_from=1100&year_to=1141&limit=200").await;
+    let windowed = find_flow(&body, origin_id, dest_id).expect("windowed flow present");
+    assert_eq!(windowed["count"], 2);
+    assert_eq!(windowed["last_year"], 1141);
     assert!(
         find_flow(&body, origin_id, nowhere_id).is_none(),
         "flow into a non-geocoded place is excluded by default"

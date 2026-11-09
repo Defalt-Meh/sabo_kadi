@@ -1156,6 +1156,13 @@ html[data-theme="dark"] #theme-toggle .icon-sun {
   opacity: 0.55;
 }
 
+/* places faded by age come back in full when pointed at or selected */
+.map-node:hover,
+.map-node:focus-visible,
+.map-node.is-selected {
+  opacity: 1 !important;
+}
+
 .map-node:hover .map-node-dot,
 .map-node:focus-visible .map-node-dot {
   stroke-width: 2.6px;
@@ -1375,6 +1382,11 @@ html[data-theme="dark"] #theme-toggle .icon-sun {
   border-top: 3px solid var(--map-edge);
   border-radius: 2px;
   opacity: 0.75;
+}
+
+.legend-line.is-faded {
+  border-top-width: 2px;
+  opacity: 0.18;
 }
 
 .legend-node {

@@ -20,6 +20,18 @@ const DRAG_THRESHOLD = 4;
 const EARTH_KM = 40075;
 const LABEL_FONT = '600 11px Inter, "Segoe UI", system-ui, sans-serif';
 
+// Age fading. Every arrow gets a "freshness" from its year's place in the
+// visible time window: 1 at the window's end (the timeline cursor), 0 at its
+// start. As the cursor moves forward, older arrows fade, thin out and lose
+// their arrowhead, so the recent movement reads first. Hovering or selecting
+// an arrow still shows it in full.
+const FADE_FLOOR_FLOWS = 0.07; // opacity of the oldest flow arrows
+const FADE_FLOOR_ROUTE = 0.16; // a single itinerary keeps its old steps legible
+const FADE_ARROWHEAD_MIN = 0.35; // below this freshness the arrowhead is hidden
+const FADE_LABEL_MIN = 0.2; // places this stale are not labelled unless selected
+const UNDATED_FRESHNESS = 0.25;
+const LABEL_BUDGET = { points: 140, flows: 90, route: 220 };
+
 // Ottoman core lands, used when there is nothing to fit to.
 const DEFAULT_BOUNDS = { west: 14, east: 48, south: 29, north: 46 };
 
@@ -78,14 +90,21 @@ export class MapView {
 
   /* ---------- public API ---------- */
 
-  setFlows(flows, { fit = true } = {}) {
-    const valid = (flows ?? []).filter(validFlow);
-    const maxCount = Math.max(1, ...valid.map((flow) => flow.count || 1));
+  // `time` ({ from, to } years) is the window arrows are aged against; without
+  // it nothing fades.
+  setFlows(flows, { fit = true, time = null } = {}) {
+    const valid = (flows ?? [])
+      .filter(validFlow)
+      .map((flow) => ({ flow, fresh: freshness(flow.last_year, time) }))
+      // oldest first so recent arrows are drawn on top; thick over thin
+      .sort((a, b) => a.fresh - b.fresh || (a.flow.count || 1) - (b.flow.count || 1));
+    const maxCount = Math.max(1, ...valid.map(({ flow }) => flow.count || 1));
     const places = new Map();
 
     this.mode = "flows";
-    this.edges = valid.map((flow) => {
+    this.edges = valid.map(({ flow, fresh }) => {
       const count = Math.max(1, flow.count || 1);
+      const strength = Math.sqrt(count / maxCount);
       const origin = project(flow.origin_longitude, flow.origin_latitude);
       const destination = project(flow.destination_longitude, flow.destination_latitude);
       const label = t("map.flowAria", {
@@ -99,16 +118,19 @@ export class MapView {
         [flow.destination_id, flow.destination, destination]
       ]) {
         const key = placeKey(id, point);
-        const place = places.get(key) ?? { key, id, name, ...point, weight: 0 };
+        const place = places.get(key) ?? { key, id, name, ...point, weight: 0, recent: 0, fresh: 0 };
         place.weight += count;
+        place.recent += count * fresh;
+        place.fresh = Math.max(place.fresh, fresh);
         places.set(key, place);
       }
 
       return {
         key: `flow:${flow.origin_id}:${flow.destination_id}`,
         ...curve(origin, destination),
-        width: 1 + 5 * Math.sqrt(count / maxCount),
-        opacity: 0.3 + 0.5 * Math.sqrt(count / maxCount),
+        width: (1 + 4 * strength) * (0.55 + 0.45 * fresh),
+        opacity: lerp(FADE_FLOOR_FLOWS, 0.35 + 0.55 * strength, fresh),
+        arrowless: fresh < FADE_ARROWHEAD_MIN,
         color: null,
         label,
         select: () => ({ type: "flow", data: flow })
@@ -124,7 +146,10 @@ export class MapView {
       r: 3.5 + 4 * Math.sqrt(place.weight / maxWeight),
       label: place.name,
       title: place.name,
-      priority: place.weight,
+      // recent activity wins the label space; total volume breaks ties
+      priority: place.recent * 1e3 + place.weight,
+      opacity: 0.35 + 0.65 * place.fresh,
+      minor: place.fresh < FADE_LABEL_MIN,
       select: () => ({ type: "place", id: place.id, data: place })
     }));
 
@@ -298,6 +323,7 @@ export class MapView {
     const nodes = [];
     const window = this.routeWindow;
     const multiple = this.routes.length > 1;
+    const time = routeFadeWindow(this.routes, window);
 
     // the active route is drawn last so it sits on top
     const ordered = [...this.routes].sort(
@@ -349,13 +375,15 @@ export class MapView {
 
         const origin = project(appointment.origin_longitude, appointment.origin_latitude);
         const destination = project(appointment.destination_longitude, appointment.destination_latitude);
+        const fresh = freshness(appointment.year_numeric, time);
 
         edges.push({
           key: `appointment:${appointment.id}`,
           routeId: route.id,
           ...curve(origin, destination),
-          width: muted ? 2 : 3,
-          opacity: muted ? 0.45 : 0.95,
+          width: (muted ? 2 : 3) * (0.6 + 0.4 * fresh),
+          opacity: lerp(FADE_FLOOR_ROUTE, muted ? 0.45 : 0.95, fresh),
+          arrowless: fresh < FADE_ARROWHEAD_MIN,
           color: routeColor(route.hue, stepPosition(index, count)),
           muted,
           label: `${appointment.sequence ?? index + 1}. ${appointment.origin ?? t("common.unknownPlace")} → ${appointment.destination ?? t("common.unknownPlace")}`,
@@ -448,6 +476,7 @@ export class MapView {
       if (node.stroke) circle.style.stroke = node.stroke;
 
       group.append(title(node.title || node.label || ""), hit, circle);
+      if (node.opacity != null) group.style.opacity = String(node.opacity);
 
       if (node.number != null) {
         const number = svg("text", { class: "map-node-number", y: "0.36em" });
@@ -463,6 +492,7 @@ export class MapView {
       if (node.label) {
         const label = svg("text", { class: node.muted ? "map-label is-muted" : "map-label" });
         label.textContent = node.label;
+        if (node.opacity != null) label.style.opacity = String(node.opacity);
         node.labelElement = label;
         this.labelLayer.append(label);
       }
@@ -527,7 +557,9 @@ export class MapView {
         "transform",
         `translate(${(p.x * scale + x).toFixed(1)} ${(p.y * scale + y).toFixed(1)}) rotate(${angle.toFixed(1)})`
       );
-      edge.arrow.style.display = length > 34 ? "" : "none";
+      // faded (old) arrows keep only their line unless they are selected
+      const headless = edge.arrowless && edge.key !== this.selectedKey;
+      edge.arrow.style.display = length > 34 && !headless ? "" : "none";
     }
 
     for (const node of this.nodes) {
@@ -588,15 +620,16 @@ export class MapView {
     }
 
     let shown = 0;
-    const budget = this.mode === "points" ? 140 : 220;
+    const budget = LABEL_BUDGET[this.mode] ?? 220;
 
     for (const node of labelled) {
       const label = node.labelElement;
+      const selected = node.key === this.selectedKey;
       const onScreen =
         node.sx > -margin && node.sx < this.width + margin &&
         node.sy > -margin && node.sy < this.height + margin;
 
-      if (!onScreen || shown >= budget) {
+      if (!onScreen || shown >= budget || (node.minor && !selected)) {
         label.style.display = "none";
         continue;
       }
@@ -609,7 +642,6 @@ export class MapView {
         { x: node.sx - width / 2, y: node.sy - node.r - 17, anchor: "middle" }
       ];
 
-      const selected = node.key === this.selectedKey;
       const spot =
         candidates.find((c) => !collides({ x: c.x - 2, y: c.y, w: width + 4, h: 14 }, node)) ??
         (selected ? candidates[0] : null);
@@ -1004,6 +1036,42 @@ function inWindow(appointment, window) {
   if (window.to != null && year > window.to) return false;
 
   return true;
+}
+
+// 0 (oldest) .. 1 (newest) for `year` inside `time` = { from, to }. Squared so
+// only the recent part of the window stays strong. No usable window: no fading.
+function freshness(year, time) {
+  const from = time?.from;
+  const to = time?.to;
+
+  if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) return 1;
+  if (!Number.isFinite(year)) return UNDATED_FRESHNESS;
+
+  const t = clamp((year - from) / (to - from), 0, 1);
+  return t * t;
+}
+
+// Routes fade only while the timeline is narrowed (playing or scrubbed); the
+// full period shows a whole itinerary evenly. Open ends fall back to the
+// routes' own first/last dated year.
+function routeFadeWindow(routes, window) {
+  if (!window || window.includeUndated !== false) return null;
+
+  const years = routes
+    .flatMap((route) => route.appointments ?? [])
+    .map((appointment) => appointment.year_numeric)
+    .filter(Number.isFinite);
+
+  if (!years.length) return null;
+
+  return {
+    from: window.from ?? Math.min(...years),
+    to: window.to ?? Math.max(...years)
+  };
+}
+
+function lerp(a, b, t) {
+  return a + (b - a) * t;
 }
 
 function validFlow(flow) {
