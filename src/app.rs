@@ -131,6 +131,14 @@ pub fn build_router(state: AppState, cfg: &Config) -> Router {
                     HeaderName::from_static("content-security-policy"),
                     WEB_CSP,
                 ))
+                // index.html and the ES modules it imports must update together:
+                // without this, browsers keep old modules from their heuristic
+                // cache after a deploy and the new page runs against old code.
+                // `no-cache` still allows a cheap 304 via Last-Modified.
+                .layer(SetResponseHeaderLayer::if_not_present(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static("no-cache"),
+                ))
                 .service(ServeDir::new(dir).append_index_html_on_directories(true));
             router.fallback_service(pages)
         }

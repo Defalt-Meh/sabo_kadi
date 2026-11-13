@@ -809,7 +809,10 @@ function applyLocale() {
   document.documentElement.lang = locale;
 
   document.querySelectorAll("[data-i18n]").forEach((element) => {
-    element.textContent = t(element.dataset.i18n);
+    const key = element.dataset.i18n;
+    const text = t(key);
+    // a missing key keeps the page's own text instead of showing the raw key
+    if (text !== key) element.textContent = text;
   });
 
   document.querySelectorAll("[data-i18n-placeholder]").forEach((element) => {
