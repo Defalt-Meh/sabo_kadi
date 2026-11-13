@@ -2,6 +2,7 @@
 
 mod activity;
 mod appointments;
+pub mod filters;
 mod flows;
 mod gazetteer;
 mod health;
@@ -9,6 +10,7 @@ mod meta;
 mod persons;
 mod places;
 mod sources;
+mod stats;
 
 use axum::extract::{FromRequestParts, OptionalFromRequestParts};
 use axum::http::request::Parts;
@@ -28,7 +30,12 @@ pub fn router() -> Router<AppState> {
         .route("/persons/{id}", get(persons::detail))
         .route("/places", get(places::list))
         .route("/places/{id}", get(places::detail))
+        .route("/session", get(crate::auth::session))
         .route("/appointments", get(appointments::list))
+        .route("/appointments/ids", get(appointments::ids))
+        .route("/export/appointments.csv", get(appointments::export_csv))
+        .route("/stats", get(stats::grouped))
+        .route("/stats/summary", get(stats::summary))
         .route("/flows", get(flows::list))
         .route("/place-activity", get(activity::places))
         .route("/gazetteer", get(gazetteer::list))
@@ -125,6 +132,17 @@ pub fn validate_year_range(year_from: Option<i32>, year_to: Option<i32>) -> ApiR
     Ok(())
 }
 
+/// `match=contains|prefix` for the name searches; `true` means prefix.
+pub fn prefix_mode(raw: Option<&str>) -> ApiResult<bool> {
+    match raw.map(str::trim) {
+        None | Some("") | Some("contains") => Ok(false),
+        Some("prefix") => Ok(true),
+        Some(_) => Err(ApiError::bad_request(
+            "`match` must be `contains` or `prefix`",
+        )),
+    }
+}
+
 /// Lightweight place reference embedded in other responses. Coordinates are
 /// `None` until a historian supplies them.
 #[derive(Debug, Serialize)]
@@ -207,6 +225,7 @@ mod tests {
                 .unwrap(),
             default_page_size: 50,
             max_page_size: 200,
+            auth: Default::default(),
         }
     }
 
@@ -218,7 +237,10 @@ mod tests {
     async fn page_defaults_and_bounds() {
         assert_eq!(page(None, None).unwrap(), (50, 0));
         assert_eq!(page(Some(1), Some(0)).unwrap(), (1, 0));
-        assert_eq!(page(Some(200), Some(10_000_000)).unwrap(), (200, 10_000_000));
+        assert_eq!(
+            page(Some(200), Some(10_000_000)).unwrap(),
+            (200, 10_000_000)
+        );
     }
 
     #[tokio::test]
@@ -256,7 +278,10 @@ mod tests {
         let place = PlaceRef::from_parts(Some(7), None, Some(40.18), Some(29.06)).unwrap();
         assert_eq!(place.id, 7);
         assert_eq!(place.canonical_name, "");
-        assert_eq!((place.latitude, place.longitude), (Some(40.18), Some(29.06)));
+        assert_eq!(
+            (place.latitude, place.longitude),
+            (Some(40.18), Some(29.06))
+        );
 
         assert!(PersonRef::from_parts(None, Some("Ahmed".into()), None).is_none());
         let person = PersonRef::from_parts(Some(3), Some("Ahmed".into()), None).unwrap();

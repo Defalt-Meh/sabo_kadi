@@ -1,11 +1,6 @@
 import { t } from "./i18n.js";
-import {
-  arrivalPosition,
-  departurePosition,
-  onRouteColor,
-  routeColor,
-  stepPosition
-} from "./colors.js";
+import { onRouteColor, routeColor } from "./colors.js";
+import { badgeText, buildItinerary, hasPoint } from "./itinerary.js";
 
 // Geometry lives in Web-Mercator "world" units; nodes, arrows and labels are
 // drawn in screen space on top, so they keep a constant size at any zoom.
@@ -16,9 +11,15 @@ const MIN_SCALE = 0.1;
 const MAX_SCALE = 80;
 const FIT_PADDING = 64;
 const FIT_MAX_SCALE = 24;
+const MIN_FIT_SPAN = 180; // world units, ≈ 8° of longitude
 const DRAG_THRESHOLD = 4;
 const EARTH_KM = 40075;
 const LABEL_FONT = '600 11px Inter, "Segoe UI", system-ui, sans-serif';
+const BADGE_FONT = '700 10px Inter, "Segoe UI", system-ui, sans-serif';
+const BADGE_HEIGHT = 19;
+// where on the colour ramp a route is drawn (one colour per kadı; the order
+// is carried by the stop numbers, not by shading)
+const ROUTE_TONE = 0.78;
 
 // Age fading. Every arrow gets a "freshness" from its year's place in the
 // visible time window: 1 at the window's end (the timeline cursor), 0 at its
@@ -63,6 +64,7 @@ export class MapView {
     this.routes = [];
     this.routeWindow = null;
     this.selectedKey = null;
+    this.focusKey = null;
     this.activeRouteId = null;
     this.view = { scale: 1, x: 0, y: 0 };
     this.width = 0;
@@ -214,6 +216,14 @@ export class MapView {
     this.draw();
   }
 
+  // A place the filters are about (e.g. the place filter): ringed and always
+  // labelled, independent of the click selection.
+  setFocus(key) {
+    this.focusKey = key ?? null;
+    this.applySelection();
+    this.scheduleLayout();
+  }
+
   highlight(key) {
     this.selectedKey = key ?? null;
     this.applySelection();
@@ -318,6 +328,10 @@ export class MapView {
     this.graticule.replaceChildren(svg("path", { d: lines.join("") }));
   }
 
+  // routes: [{ id, hue, appointments, matched }]. `matched` (a Set of
+  // appointment ids, or null) marks the steps that pass the sidebar filters;
+  // the others stay visible but faded. Stops and legs come from
+  // buildItinerary, the same numbering the side panel shows.
   buildRoutes() {
     const edges = [];
     const nodes = [];
@@ -331,83 +345,86 @@ export class MapView {
     );
 
     for (const route of ordered) {
-      const all = route.appointments ?? [];
-      const count = all.length;
+      const { stops } = buildItinerary(route.appointments ?? []);
       const muted = multiple && route.id !== this.activeRouteId;
+      const color = routeColor(route.hue, ROUTE_TONE);
+      const matched = route.matched ?? null;
+      const isMatch = (stop) =>
+        !matched || matched.has(stop.appointment.id) || stop.events.some((event) => matched.has(event.id));
+
+      // numbers follow the whole itinerary, even for hidden steps
+      const drawn = stops
+        .filter((stop) => hasPoint(stop) && inWindow(stop.appointment, window))
+        .map((stop) => ({ stop, point: project(stop.longitude, stop.latitude) }));
+
       const places = new Map();
-      let order = 0;
 
-      all.forEach((appointment, index) => {
-        // an outgoing kadı does not travel in this record: they were at
-        // new_place and left it, so only that place belongs to their route
-        const departed = appointment.role === "departed";
-        const hasOrigin = !departed && hasPoint(appointment, "origin");
-        const hasDestination = hasPoint(appointment, "destination");
-        const visible = inWindow(appointment, window);
+      for (const { stop, point } of drawn) {
+        const key = placeKey(stop.placeId, point);
+        const place = places.get(key) ?? {
+          key,
+          id: stop.placeId,
+          name: stop.name ?? "",
+          ...point,
+          numbers: [],
+          match: false
+        };
+        place.numbers.push(stop.n);
+        if (isMatch(stop)) place.match = true;
+        places.set(key, place);
+      }
 
-        // numbers follow the whole itinerary, even for hidden steps
-        for (const [side, present, position] of [
-          ["origin", hasOrigin, departurePosition(index, count)],
-          ["destination", hasDestination, arrivalPosition(index, count)]
-        ]) {
-          if (!present) continue;
-
-          const point = project(appointment[`${side}_longitude`], appointment[`${side}_latitude`]);
-          const key = placeKey(appointment[`${side}_place_id`], point);
-
-          if (!places.has(key)) {
-            order += 1;
-            places.set(key, {
-              key,
-              id: appointment[`${side}_place_id`] ?? null,
-              name: appointment[side] ?? "",
-              ...point,
-              order,
-              position,
-              visible: false
-            });
-          }
-
-          if (visible) places.get(key).visible = true;
-        }
-
-        if (departed || !hasOrigin || !hasDestination || !visible) return;
-
-        const origin = project(appointment.origin_longitude, appointment.origin_latitude);
-        const destination = project(appointment.destination_longitude, appointment.destination_latitude);
-        const fresh = freshness(appointment.year_numeric, time);
+      for (let i = 1; i < drawn.length; i += 1) {
+        const from = drawn[i - 1];
+        const to = drawn[i];
+        // solid only when one record takes the kadı from this stop to the next
+        const direct = to.stop.n === from.stop.n + 1 && to.stop.linked;
+        const fresh = freshness(to.stop.appointment.year_numeric, time);
+        const hit = isMatch(to.stop);
+        const names = {
+          from: from.stop.n,
+          to: to.stop.n,
+          a: from.stop.name ?? t("common.unknownPlace"),
+          b: to.stop.name ?? t("common.unknownPlace")
+        };
 
         edges.push({
-          key: `appointment:${appointment.id}`,
+          key: `leg:${route.id}:${from.stop.n}-${to.stop.n}`,
           routeId: route.id,
-          ...curve(origin, destination),
-          width: (muted ? 2 : 3) * (0.6 + 0.4 * fresh),
-          opacity: lerp(FADE_FLOOR_ROUTE, muted ? 0.45 : 0.95, fresh),
+          ...curve(from.point, to.point),
+          width: (muted ? 2 : 3) * (0.6 + 0.4 * fresh) * (hit ? 1 : 0.75),
+          opacity: lerp(FADE_FLOOR_ROUTE, muted ? 0.45 : 0.95, fresh) * (hit ? 1 : 0.3),
           arrowless: fresh < FADE_ARROWHEAD_MIN,
-          color: routeColor(route.hue, stepPosition(index, count)),
+          dashed: !direct,
+          color,
           muted,
-          label: `${appointment.sequence ?? index + 1}. ${appointment.origin ?? t("common.unknownPlace")} → ${appointment.destination ?? t("common.unknownPlace")}`,
-          select: () => ({ type: "appointment", data: appointment, personId: route.id })
+          label: direct
+            ? t("map.legDirect", names)
+            : t("map.legGap", { ...names, skipped: to.stop.n - from.stop.n - 1 }),
+          select: () => ({ type: "appointment", data: to.stop.appointment, personId: route.id })
         });
-      });
+      }
 
       for (const place of places.values()) {
-        if (!place.visible) continue;
+        const badge = badgeText(place.numbers);
+        const width = Math.max(BADGE_HEIGHT, this.textWidth(badge, BADGE_FONT) + 10);
 
         nodes.push({
           key: place.id != null ? `place:${place.id}` : place.key,
           routeId: route.id,
           x: place.x,
           y: place.y,
-          r: muted ? 7.5 : 9.5,
+          r: width / 2,
+          badge,
+          badgeWidth: width,
           label: place.name,
-          title: `${place.order}. ${place.name}`,
-          number: place.order,
-          fill: routeColor(route.hue, place.position),
+          title: t("map.stopTitle", { numbers: place.numbers.join(", "), name: place.name }),
+          fill: color,
           stroke: routeColor(route.hue, 1),
-          text: onRouteColor(place.position),
+          text: onRouteColor(ROUTE_TONE),
           muted,
-          priority: (muted ? 0 : 1e6) + (1e3 - place.order),
+          dim: !place.match,
+          priority: (muted ? 0 : 1e6) + (place.match ? 5e5 : 0) + (1e3 - place.numbers[0]),
           select: () => ({ type: "place", id: place.id, data: place, personId: route.id })
         });
       }
@@ -433,7 +450,7 @@ export class MapView {
 
     for (const edge of this.edges) {
       const path = svg("path", {
-        class: edge.muted ? "map-edge is-muted" : "map-edge",
+        class: ["map-edge", edge.muted ? "is-muted" : "", edge.dashed ? "is-dashed" : ""].filter(Boolean).join(" "),
         d: edge.d,
         tabindex: "0",
         "data-key": edge.key,
@@ -461,7 +478,7 @@ export class MapView {
         class: [
           "map-node",
           node.filled ? "is-filled" : "",
-          node.number != null ? "is-numbered" : "",
+          node.badge != null ? "is-numbered" : "",
           node.muted ? "is-muted" : ""
         ].filter(Boolean).join(" "),
         tabindex: "0",
@@ -469,18 +486,30 @@ export class MapView {
         "aria-label": node.title || node.label || t("common.unknownPlace")
       });
 
-      const hit = svg("circle", { class: "map-node-hit", r: Math.max(node.r + 5, 11) });
-      const circle = svg("circle", { class: "map-node-dot", r: node.r });
+      let hit;
+      let shape;
 
-      if (node.fill) circle.style.fill = node.fill;
-      if (node.stroke) circle.style.stroke = node.stroke;
+      if (node.badge != null) {
+        // route stop: a pill carrying every stop number at this place
+        const w = node.badgeWidth;
+        const h = BADGE_HEIGHT;
+        hit = svg("rect", { class: "map-node-hit", x: -w / 2 - 5, y: -h / 2 - 5, width: w + 10, height: h + 10, rx: h / 2 + 5 });
+        shape = svg("rect", { class: "map-node-dot map-node-pill", x: -w / 2, y: -h / 2, width: w, height: h, rx: h / 2 });
+      } else {
+        hit = svg("circle", { class: "map-node-hit", r: Math.max(node.r + 5, 11) });
+        shape = svg("circle", { class: "map-node-dot", r: node.r });
+      }
 
-      group.append(title(node.title || node.label || ""), hit, circle);
+      if (node.fill) shape.style.fill = node.fill;
+      if (node.stroke) shape.style.stroke = node.stroke;
+
+      group.append(title(node.title || node.label || ""), hit, shape);
       if (node.opacity != null) group.style.opacity = String(node.opacity);
+      if (node.dim) group.classList.add("is-dim");
 
-      if (node.number != null) {
+      if (node.badge != null) {
         const number = svg("text", { class: "map-node-number", y: "0.36em" });
-        number.textContent = String(node.number);
+        number.textContent = node.badge;
         if (node.text) number.style.fill = node.text;
         group.append(number);
       }
@@ -490,7 +519,7 @@ export class MapView {
       node.element = group;
 
       if (node.label) {
-        const label = svg("text", { class: node.muted ? "map-label is-muted" : "map-label" });
+        const label = svg("text", { class: node.muted || node.dim ? "map-label is-muted" : "map-label" });
         label.textContent = node.label;
         if (node.opacity != null) label.style.opacity = String(node.opacity);
         node.labelElement = label;
@@ -527,6 +556,7 @@ export class MapView {
     for (const element of this.svg.querySelectorAll("[data-key]")) {
       const active = element.dataset.key === this.selectedKey;
       element.classList.toggle("is-selected", active);
+      element.classList.toggle("is-focus", element.dataset.key === this.focusKey);
       // bring the selection to the front of its layer
       if (active) element.parentNode.append(element);
     }
@@ -582,6 +612,7 @@ export class MapView {
       .filter((node) => node.labelElement)
       .sort((a, b) =>
         Number(b.key === this.selectedKey) - Number(a.key === this.selectedKey) ||
+        Number(b.key === this.focusKey) - Number(a.key === this.focusKey) ||
         (b.priority ?? 0) - (a.priority ?? 0)
       );
 
@@ -624,7 +655,7 @@ export class MapView {
 
     for (const node of labelled) {
       const label = node.labelElement;
-      const selected = node.key === this.selectedKey;
+      const selected = node.key === this.selectedKey || node.key === this.focusKey;
       const onScreen =
         node.sx > -margin && node.sx < this.width + margin &&
         node.sy > -margin && node.sy < this.height + margin;
@@ -665,12 +696,18 @@ export class MapView {
   }
 
   labelWidth(text) {
-    if (!this.labelWidths.has(text)) {
-      this.measureContext.font = LABEL_FONT;
-      this.labelWidths.set(text, Math.ceil(this.measureContext.measureText(text).width));
+    return this.textWidth(text, LABEL_FONT);
+  }
+
+  textWidth(text, font) {
+    const key = `${font}|${text}`;
+
+    if (!this.labelWidths.has(key)) {
+      this.measureContext.font = font;
+      this.labelWidths.set(key, Math.ceil(this.measureContext.measureText(text).width));
     }
 
-    return this.labelWidths.get(text);
+    return this.labelWidths.get(key);
   }
 
   updateScaleBar() {
@@ -742,6 +779,8 @@ export class MapView {
   }
 
   fitBounds(bounds, { animate = false } = {}) {
+    // a single place (or a tight cluster) keeps some surroundings in view
+    bounds = withMinimumSpan(bounds, MIN_FIT_SPAN);
     const usableWidth = Math.max(this.width - FIT_PADDING * 2, 40);
     const usableHeight = Math.max(this.height - FIT_PADDING * 2, 40);
     const scale = clamp(
@@ -1011,6 +1050,16 @@ function pathFromLonLat(points, closed) {
   return closed && d ? `${d}Z` : d;
 }
 
+function withMinimumSpan(bounds, span) {
+  const grow = (min, max) => {
+    const missing = Math.max(0, span - (max - min)) / 2;
+    return [min - missing, max + missing];
+  };
+  const [minX, maxX] = grow(bounds.minX, bounds.maxX);
+  const [minY, maxY] = grow(bounds.minY, bounds.maxY);
+  return { minX, maxX, minY, maxY };
+}
+
 function boundsFromLonLat({ west, east, south, north }) {
   const a = project(west, north);
   const b = project(east, south);
@@ -1019,11 +1068,6 @@ function boundsFromLonLat({ west, east, south, north }) {
 
 function placeKey(id, point) {
   return id != null ? `id:${id}` : `xy:${point.x.toFixed(2)}:${point.y.toFixed(2)}`;
-}
-
-function hasPoint(appointment, side) {
-  return Number.isFinite(appointment?.[`${side}_latitude`]) &&
-    Number.isFinite(appointment?.[`${side}_longitude`]);
 }
 
 function inWindow(appointment, window) {

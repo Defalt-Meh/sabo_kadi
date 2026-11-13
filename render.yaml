@@ -12,3 +12,7 @@ services:
     envVars:
       - key: DATABASE_URL
         sync: false
+      # optional: set it to hide source texts from visitors (user view);
+      # administrators log in at /admin/login. Leave empty for open access.
+      - key: KADI_ATLAS__ADMIN_PASSWORD
+        sync: false

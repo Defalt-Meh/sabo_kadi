@@ -1,11 +1,16 @@
 import {
+  countPlacesWithPrefix,
+  getAppointmentIds,
   getAppointments,
   getFlows,
   getMeta,
   getPerson,
   getPlace,
   getPlaceActivity,
+  getSession,
   getSource,
+  getStats,
+  getSummary,
   isAbort,
   searchPersons,
   searchPlaces,
@@ -13,19 +18,16 @@ import {
 } from "./js/api.js";
 
 import { MapView } from "./js/map.js";
-import { getLocale, numberLocale, t } from "./js/i18n.js";
-import {
-  MAX_ROUTES,
-  arrivalPosition,
-  departurePosition,
-  pickHue,
-  routeColor,
-  routeGradient,
-  stepPosition
-} from "./js/colors.js";
+import { getLocale, t } from "./js/i18n.js";
+import { MAX_ROUTES, pickHue, routeColor } from "./js/colors.js";
+import { formatDate, formatYear, getDateMode, gregorianRangeLabel, setDateMode } from "./js/calendar.js";
+import { buildItinerary, hasPoint } from "./js/itinerary.js";
+import { createQueryView } from "./js/query.js";
+import { $, $$, el, formatNumber } from "./js/dom.js";
 
-const $ = (selector, root = document) => root.querySelector(selector);
-const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
+const VIEWS = ["map", "query", "sources"];
+const VIEW_PREF_KEY = "kadi-atlas-user-view";
+const PLACE_PERSONS_LIMIT = 100;
 
 const FLOW_LIMIT = 200;
 const SOURCE_PAGE = 30;
@@ -43,6 +45,9 @@ const els = {
   datasetStatus: $("#dataset-status"),
   datasetStatusLabel: $("#dataset-status-label"),
   navItems: $$(".nav-item[data-view]"),
+  navSources: $("#nav-sources"),
+  viewToggle: $("#view-toggle"),
+  accessLink: $("#access-link"),
   aboutButton: $('[data-action="about"]'),
   aboutDialog: $("#about-dialog"),
   aboutClose: $("#about-close"),
@@ -59,6 +64,8 @@ const els = {
   timelineMin: $("#timeline-min"),
   timelineMax: $("#timeline-max"),
   timelineRange: $("#timeline-range"),
+  yearGregorian: $("#year-gregorian"),
+  dateModeButtons: $$("[data-date-mode]"),
 
   degreeFilter: $("#degree-filter"),
   positionFilter: $("#position-filter"),
@@ -67,6 +74,7 @@ const els = {
   placeFilter: $("#place-filter"),
   placeFilterName: $("#place-filter-name"),
   placeFilterClear: $("#place-filter-clear"),
+  directionFilter: $("#direction-filter"),
   resetFilters: $("#reset-filters"),
 
   metricRecords: $("#metric-records"),
@@ -79,6 +87,7 @@ const els = {
   mapEyebrow: $("#map-eyebrow"),
   mapTitle: $("#map-title"),
   mapSubtitle: $("#map-subtitle"),
+  mapCoverage: $("#map-coverage"),
   resultCount: $("#result-count"),
   mapLoading: $("#map-loading"),
   mapEmpty: $("#map-empty"),
@@ -96,6 +105,7 @@ const els = {
   timelinePlay: $("#timeline-play"),
   timelineAll: $("#timeline-all"),
 
+  queryView: $("#query-view"),
   sourcesView: $("#sources-view"),
   sourcesForm: $("#sources-form"),
   sourcesQuery: $("#sources-query"),
@@ -107,6 +117,7 @@ const els = {
   details: $("#details-panel"),
   detailsFab: $("#details-fab"),
   closeDetails: $("#close-details"),
+  detailBack: $("#detail-back"),
   detailEyebrow: $("#detail-eyebrow"),
   detailTitle: $("#detail-title"),
   detailSubtitle: $("#detail-subtitle"),
@@ -129,14 +140,27 @@ const state = {
   yearTo: null,
   degree: "",
   positionType: "",
-  place: null, // { id, name }
+  // { id, name, hasCoordinates } for one place, or { prefix, name } for every
+  // place whose name starts with `prefix`
+  place: null,
+  direction: "", // "" | "arrival" | "departure", only with a place
+
+  // { role: "admin" | "user", login_enabled }; `userView` lets an admin
+  // preview what visitors see
+  session: { role: "admin", login_enabled: false },
+  userView: readUserViewPreference(),
+
+  // how many of the selected records the map can draw
+  summary: null,
 
   // timeline cursor: null = the whole selected range
   cursor: null,
   playing: false,
   playTimer: 0,
 
-  // every kadı drawn on the map: [{ person, hue }]
+  // every kadı drawn on the map: [{ person, hue, matched }]; `matched` is the
+  // Set of this kadı's appointment ids that pass the sidebar filters (null
+  // when no step filter is active)
   persons: [],
   activePersonId: null,
 
@@ -152,6 +176,12 @@ const state = {
   detailRequest: 0,
   recordRequest: 0,
   lastHash: null,
+  matchRequest: 0,
+
+  // browser history: position of the current entry, and whether the state is
+  // being restored from it (then nothing new is pushed)
+  historyIndex: 0,
+  restoring: false,
 
   sources: {
     q: "",
@@ -184,17 +214,51 @@ setupCombobox({
 setupCombobox({
   input: els.placeSearch,
   list: els.placeResults,
-  search: (query, signal) => searchPlaces(query, { signal }),
-  describe: (place) => ({
-    label: place.name,
-    meta: t("appointments.count", { count: formatNumber(place.appointment_count) }),
-    note: place.latitude == null ? t("common.noCoordinates") : ""
-  }),
-  onPick: (place) => {
-    setPlaceFilter({ id: place.id, name: place.name });
-    showPlace(place.id);
+  // the first option selects every place whose name starts with the text
+  // ("Misis" → "Misis", "Misis maa Ayaş", …) when there is more than one
+  search: async (query, signal) => {
+    const [places, prefixCount] = await Promise.all([
+      searchPlaces(query, { signal }),
+      countPlacesWithPrefix(query, { signal })
+    ]);
+    const items = places.map((place) => ({ kind: "place", ...place }));
+    if (prefixCount > 1) items.unshift({ kind: "group", prefix: query, count: prefixCount });
+    return items;
   },
+  describe: (item) =>
+    item.kind === "group"
+      ? {
+          label: t("filters.prefixGroup", { prefix: item.prefix }),
+          meta: t("filters.prefixGroupCount", { count: formatNumber(item.count) }),
+          group: true
+        }
+      : {
+          label: item.name,
+          meta: t("appointments.count", { count: formatNumber(item.appointment_count) }),
+          note: item.latitude == null ? t("common.noCoordinates") : ""
+        },
+  onPick: (item) =>
+    pickPlace(
+      item.kind === "group"
+        ? { prefix: item.prefix, name: item.prefix }
+        : { id: item.id, name: item.name, hasCoordinates: item.latitude != null }
+    ),
   errorMessage: () => t("errors.placeSearch")
+});
+
+const queryView = createQueryView({
+  getFilters: () => tableFilters(),
+  describeFilters: () => describeFilters({ withPersons: true }),
+  onRecord: (appointment) => openRecord({ appointment }),
+  onPlace: (id) => showPlace(id),
+  onPerson: (id) => addPerson(id, { stay: true }),
+  onPeriod: (from, to) => {
+    state.yearFrom = Math.max(from, state.meta?.min_year ?? from);
+    state.yearTo = Math.min(to, state.meta?.max_year ?? to);
+    syncFilterInputs();
+    filtersChanged();
+  },
+  onChange: () => writeHash()
 });
 
 bindEvents();
@@ -209,7 +273,15 @@ async function bootstrap() {
   setMapLoading(true);
 
   try {
-    state.meta = await getMeta();
+    const [meta, session] = await Promise.all([
+      getMeta(),
+      getSession().catch((error) => {
+        console.error(error);
+        return { role: "admin", login_enabled: false };
+      })
+    ]);
+    state.meta = meta;
+    state.session = session;
   } catch (error) {
     console.error(error);
     setStatus("error");
@@ -224,12 +296,14 @@ async function bootstrap() {
 
   setStatus("ready");
   renderMeta();
+  renderAccess();
+  renderDateMode();
 
-  await restoreFromHash();
+  state.historyIndex = Number(history.state?.kadiIndex) || 0;
+  history.replaceState({ kadiIndex: state.historyIndex }, "", location.href);
+  updateBackButton();
 
-  syncFilterInputs();
-  renderDetail();
-  await refreshMap({ fit: true });
+  await restoreAndRender();
 }
 
 function bindEvents() {
@@ -250,8 +324,31 @@ function bindEvents() {
 
   els.placeFilterClear.addEventListener("click", () => {
     setPlaceFilter(null);
-    if (state.detail.kind === "place") renderDetail();
+    if (state.detail.kind === "place" || state.detail.kind === "placeGroup") renderDetail();
   });
+
+  els.directionFilter.addEventListener("change", () => {
+    state.direction = els.directionFilter.value;
+    filtersChanged();
+  });
+
+  for (const button of els.dateModeButtons) {
+    button.addEventListener("click", () => setDateMode(button.dataset.dateMode));
+  }
+  window.addEventListener("kadi:datemodechange", onDateModeChange);
+
+  els.viewToggle.addEventListener("click", () => {
+    state.userView = !state.userView;
+    try {
+      localStorage.setItem(VIEW_PREF_KEY, state.userView ? "1" : "0");
+    } catch {
+      // the preview then lasts for this visit only
+    }
+    renderAccess();
+    renderDetail();
+  });
+
+  els.detailBack.addEventListener("click", () => history.back());
 
   els.resetFilters.addEventListener("click", resetFilters);
 
@@ -305,12 +402,14 @@ function bindEvents() {
     if (state.detail.kind === "person") renderDetail();
   });
 
-  window.addEventListener("hashchange", async () => {
-    if (!state.meta || location.hash === state.lastHash) return;
-    await restoreFromHash();
-    syncFilterInputs();
-    renderDetail();
-    refreshMap({ fit: true });
+  // Back / Forward (and a hand-edited address) restore the whole screen:
+  // filters, selected kadıs, view and the open detail all live in the hash.
+  window.addEventListener("popstate", (event) => {
+    if (!state.meta) return;
+    state.historyIndex = Number(event.state?.kadiIndex) || 0;
+    updateBackButton();
+    if (location.hash === state.lastHash) return;
+    restoreAndRender();
   });
 
   document.addEventListener("keydown", (event) => {
@@ -341,8 +440,8 @@ function renderMeta() {
 
   const hasYears = meta.min_year != null && meta.max_year != null;
 
-  els.timelineMin.textContent = hasYears ? meta.min_year : "—";
-  els.timelineMax.textContent = hasYears ? meta.max_year : "—";
+  els.timelineMin.textContent = hasYears ? formatYear(meta.min_year) : "—";
+  els.timelineMax.textContent = hasYears ? formatYear(meta.max_year) : "—";
 
   for (const input of [els.yearFrom, els.yearTo]) {
     input.disabled = !hasYears;
@@ -376,15 +475,51 @@ function syncFilterInputs() {
   els.yearFrom.value = state.yearFrom ?? "";
   els.yearTo.value = state.yearTo ?? "";
   populateFilterOptions();
-
-  els.placeFilter.hidden = !state.place;
-  els.placeFilterName.textContent = state.place?.name ?? "";
+  renderPlaceFilter();
 
   setYearError("");
   syncTimeline();
   updateRangeVisual();
+  renderYearHint();
   renderPersonChips();
   renderMapMode();
+}
+
+function renderPlaceFilter() {
+  els.placeFilter.hidden = !state.place;
+  els.placeFilterName.textContent = state.place ? placeLabel(state.place) : "";
+  els.directionFilter.disabled = !state.place;
+  els.directionFilter.value = state.place ? state.direction : "";
+  els.directionFilter.title = state.place ? "" : t("filters.directionNeedsPlace");
+}
+
+// The Gregorian equivalent of the year range, when dates are shown converted.
+function renderYearHint() {
+  const show = getDateMode() !== "hijri" && state.yearFrom != null && state.yearTo != null;
+  els.yearGregorian.hidden = !show;
+  els.yearGregorian.textContent = show
+    ? t("time.gregorianRange", { range: gregorianRangeLabel(state.yearFrom, state.yearTo) })
+    : "";
+}
+
+function renderDateMode() {
+  const mode = getDateMode();
+  for (const button of els.dateModeButtons) {
+    const active = button.dataset.dateMode === mode;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-pressed", String(active));
+  }
+}
+
+function onDateModeChange() {
+  renderDateMode();
+  if (!state.meta) return;
+  renderMeta();
+  syncTimeline();
+  renderYearHint();
+  renderMapHeading();
+  renderDetail();
+  queryView.render();
 }
 
 function applyYearInputs() {
@@ -432,14 +567,38 @@ function parseYear(value) {
   return Number.isInteger(number) && Math.abs(number) < 100000 ? number : undefined;
 }
 
+function samePlace(a, b) {
+  return (a?.id ?? null) === (b?.id ?? null) && (a?.prefix ?? null) === (b?.prefix ?? null);
+}
+
 function setPlaceFilter(place) {
-  if ((place?.id ?? null) === (state.place?.id ?? null)) return;
+  if (samePlace(place, state.place)) return;
 
   state.place = place;
+  if (!place) state.direction = "";
   els.placeSearch.value = "";
-  els.placeFilter.hidden = !place;
-  els.placeFilterName.textContent = place?.name ?? "";
+  renderPlaceFilter();
   filtersChanged();
+}
+
+// A place picked in the sidebar search. With kadıs on the map the filter
+// narrows their itineraries and their panel stays open; otherwise the place
+// (or the name group) opens in the panel.
+function pickPlace(place) {
+  setPlaceFilter(place);
+
+  if (state.persons.length) {
+    toast(t("filters.appliedToRoutes", { place: placeLabel(place) }));
+    return;
+  }
+
+  if (place.id != null) showPlace(place.id);
+  else showPlaceGroup();
+}
+
+function placeLabel(place) {
+  if (!place) return "";
+  return place.prefix ? t("filters.prefixLabel", { prefix: place.prefix }) : place.name;
 }
 
 function filtersChanged() {
@@ -447,29 +606,34 @@ function filtersChanged() {
   state.cursor = null;
   syncTimeline();
   updateRangeVisual();
+  renderYearHint();
+  renderPlaceFilter();
   writeHash();
   refreshMap({ fit: true });
+  refreshRouteMatches();
+  queryView.invalidate();
 
+  reloadDetailForFilters();
+}
+
+// Detail views whose lists depend on the filters.
+function reloadDetailForFilters() {
   if (state.detail.kind === "flow") loadFlowDetail(state.detail.flow);
+  if (state.detail.kind === "place" || state.detail.kind === "placeGroup") loadPlacePersons();
 }
 
 function resetFilters() {
-  stopPlayback();
-
   state.yearFrom = state.meta?.min_year ?? null;
   state.yearTo = state.meta?.max_year ?? null;
   state.degree = "";
   state.positionType = "";
   state.place = null;
-  state.cursor = null;
+  state.direction = "";
   els.placeSearch.value = "";
 
   syncFilterInputs();
-  writeHash();
-  refreshMap({ fit: true });
-
-  if (state.detail.kind === "flow") loadFlowDetail(state.detail.flow);
-  if (state.detail.kind === "place") renderDetail();
+  filtersChanged();
+  renderDetail();
 }
 
 // The window that actually applies: the timeline cursor pulls in the end.
@@ -488,17 +652,74 @@ function isFullRange() {
   return (from == null || from <= meta.min_year) && (to == null || to >= meta.max_year);
 }
 
+// The filters for the map's flows / places (selected kadıs are drawn as
+// routes instead, so they are not part of these).
 function queryFilters() {
   const { from, to } = effectiveWindow();
+  const meta = state.meta;
   const filters = {};
 
-  if (from != null) filters.year_from = from;
-  if (to != null) filters.year_to = to;
+  // only a narrowed end is sent: a year bound also drops the undated records,
+  // which the full period must keep
+  if (from != null && (meta?.min_year == null || from > meta.min_year)) filters.year_from = from;
+  if (to != null && (meta?.max_year == null || to < meta.max_year)) filters.year_to = to;
   if (state.degree) filters.degree = state.degree;
   if (state.positionType) filters.position_type = state.positionType;
-  if (state.place) filters.place_id = state.place.id;
+
+  return { ...filters, ...placeFilters() };
+}
+
+function placeFilters() {
+  const filters = {};
+
+  if (state.place?.id != null) filters.place_id = state.place.id;
+  else if (state.place?.prefix) filters.place_prefix = state.place.prefix;
+  if (state.place && state.direction) filters.direction = state.direction;
 
   return filters;
+}
+
+// The query page and charts: the same filters, plus the selected kadıs.
+function tableFilters() {
+  const filters = queryFilters();
+  if (state.persons.length) filters.persons = state.persons.map((entry) => entry.person.id);
+  return filters;
+}
+
+// Filters that pick steps out of a kadı's itinerary (the year window is
+// applied on the map itself, so it is not one of them).
+function stepFilters() {
+  const filters = placeFilters();
+  if (state.degree) filters.degree = state.degree;
+  if (state.positionType) filters.position_type = state.positionType;
+  return filters;
+}
+
+function hasStepFilters() {
+  return Boolean(state.degree || state.positionType || state.place);
+}
+
+// "Süzgeç: 1150–1170 · Larende (gelenler) · …" for headings and notes.
+function describeFilters({ withPersons = false, withPlace = true, bare = false } = {}) {
+  const { from, to } = effectiveWindow();
+  const parts = [];
+
+  if (!isFullRange() && from != null && to != null) {
+    parts.push(t("map.years", { from: formatYear(from), to: formatYear(to) }));
+  }
+  if (state.degree) parts.push(state.degree);
+  if (state.positionType) parts.push(state.positionType);
+  if (withPlace && state.place) {
+    parts.push(state.direction
+      ? t(`filters.placeWith.${state.direction}`, { place: placeLabel(state.place) })
+      : placeLabel(state.place));
+  }
+  if (withPersons && state.persons.length) {
+    parts.push(state.persons.map((entry) => entry.person.name).join(", "));
+  }
+
+  if (bare) return parts.join(" · ");
+  return parts.length ? t("map.filteredBy", { filters: parts.join(" · ") }) : t("query.noFilters");
 }
 
 function hasActiveFilters() {
@@ -542,9 +763,9 @@ function syncTimeline() {
   els.timelineAll.hidden = state.cursor == null;
   els.timelineCurrent.textContent =
     state.cursor != null
-      ? t("time.until", { from: from ?? "…", year: state.cursor })
+      ? t("time.until", { from: from != null ? formatYear(from) : "…", year: formatYear(state.cursor) })
       : from != null && to != null
-        ? t("time.rangeLabel", { from, to })
+        ? t("time.rangeLabel", { from: formatYear(from), to: formatYear(to) })
         : t("time.allPeriod");
 
   renderPlayButton();
@@ -563,6 +784,7 @@ function setCursor(year, { debounce = false } = {}) {
   state.cursor = year;
   syncTimeline();
   updateRangeVisual();
+  queryView.invalidate();
 
   clearTimeout(cursorTimer);
 
@@ -670,23 +892,29 @@ async function refreshMap({ fit = false, quiet = false } = {}) {
 
   try {
     const filters = queryFilters();
+    const options = { signal: controller.signal };
+    const [result, summary] = await Promise.all([
+      state.mapMode === "flows"
+        ? getFlows({ ...filters, limit: FLOW_LIMIT }, options)
+        : getPlaceActivity(filters, options),
+      getSummary(filters, options)
+    ]);
+    if (request !== state.mapRequest) return;
+
+    state.summary = summary;
 
     if (state.mapMode === "flows") {
-      const { items, total } = await getFlows({ ...filters, limit: FLOW_LIMIT }, { signal: controller.signal });
-      if (request !== state.mapRequest) return;
-
-      map.setFlows(items, { fit, time: fadeWindow() });
-      state.lastCount = { kind: "flows", shown: items.length, total };
+      map.setFlows(result.items, { fit, time: fadeWindow() });
+      state.lastCount = { kind: "flows", shown: result.items.length, total: result.total };
     } else {
-      const { items, total } = await getPlaceActivity(filters, { signal: controller.signal });
-      if (request !== state.mapRequest) return;
-
-      map.setPoints(items, { fit });
-      state.lastCount = { kind: "points", shown: items.length, total };
+      map.setPoints(result.items, { fit });
+      state.lastCount = { kind: "points", shown: result.items.length, total: result.total };
     }
+    map.setFocus(focusKey());
 
     renderMapHeading();
     renderLegend();
+    renderCoverage();
     setMapEmpty(map.hasContent() ? null : emptyReason());
   } catch (error) {
     if (request !== state.mapRequest || isAbort(error)) return;
@@ -694,7 +922,9 @@ async function refreshMap({ fit = false, quiet = false } = {}) {
     console.error(error);
     map.clear();
     state.lastCount = null;
+    state.summary = null;
     renderMapHeading();
+    renderCoverage();
     setMapEmpty({
       title: t("errors.mapLoad"),
       text: error.message,
@@ -705,9 +935,78 @@ async function refreshMap({ fit = false, quiet = false } = {}) {
   }
 }
 
+function focusKey() {
+  return state.place?.id != null ? `place:${state.place.id}` : null;
+}
+
+// "Of the 512 records selected, 41 can be drawn": most records name a place
+// without validated coordinates (or no old place at all), so the map is
+// always a subset — say which.
+function renderCoverage() {
+  const note = els.mapCoverage;
+  note.replaceChildren();
+
+  if (state.persons.length) {
+    const entry = activeEntry();
+    if (!entry) {
+      note.hidden = true;
+      return;
+    }
+    const { stops } = buildItinerary(entry.person.appointments);
+    const drawn = stops.filter(hasPoint).length;
+    note.append(t("map.routeCoverage", { drawn: formatNumber(drawn), total: formatNumber(stops.length) }));
+    if (drawn < stops.length) note.append(" ", t("map.routeCoverageHint"));
+
+    // the filters picked steps, but none of them can be drawn
+    const matched = entry.matched;
+    if (matched && matched.size) {
+      const hits = stops.filter((stop) => matched.has(stop.appointment.id));
+      if (hits.length && !hits.some(hasPoint)) {
+        note.append(" ", el("strong", {}, t("map.routeMatchNotOnMap", { count: formatNumber(matched.size) })));
+      }
+    }
+    note.hidden = false;
+    return;
+  }
+
+  const summary = state.summary;
+  if (!summary) {
+    note.hidden = true;
+    return;
+  }
+
+  note.append(t("map.coverage", {
+    mapped: formatNumber(summary.mapped),
+    records: formatNumber(summary.records)
+  }));
+
+  if (summary.records > summary.mapped) {
+    const link = el("button", { type: "button", class: "inline-link" }, t("actions.showTable"));
+    link.addEventListener("click", () => setView("query"));
+    note.append(" ", link);
+  }
+
+  note.hidden = false;
+}
+
 function emptyReason() {
   if (!state.meta?.places_with_coordinates) {
     return { title: t("map.noGeoTitle"), text: t("map.noGeoText") };
+  }
+
+  const summary = state.summary;
+  const toTable = { label: t("actions.showTable"), run: () => setView("query") };
+
+  // there are records, but none of them can be drawn
+  if (summary && summary.records > 0) {
+    const placeWithoutPoint = state.place?.id != null && state.place.hasCoordinates === false;
+    return {
+      title: t("map.noMappedTitle", { count: formatNumber(summary.records) }),
+      text: placeWithoutPoint
+        ? t("map.placeNoGeoText", { name: state.place.name })
+        : t("map.noMappedText"),
+      action: toTable
+    };
   }
 
   if (hasActiveFilters()) {
@@ -738,17 +1037,29 @@ function routeWindow() {
 
 function drawRoutes({ fit = false } = {}) {
   map.setRoutes(
-    state.persons.map(({ person, hue }) => ({ id: person.id, hue, appointments: person.appointments })),
+    state.persons.map(({ person, hue, matched }) => ({
+      id: person.id,
+      hue,
+      appointments: person.appointments,
+      matched: matched ?? null
+    })),
     { activeId: state.activePersonId, window: routeWindow(), fit }
   );
+  map.setFocus(focusKey());
 
   renderMapHeading();
   renderLegend();
+  renderCoverage();
 
-  const anyCoordinates = state.persons.some(({ person }) => person.appointments.some(isDrawable));
+  const anyCoordinates = state.persons.some(({ person }) =>
+    buildItinerary(person.appointments).stops.some(hasPoint));
 
   if (!anyCoordinates) {
-    setMapEmpty({ title: t("map.routeNoGeoTitle"), text: t("map.routeNoGeoText") });
+    setMapEmpty({
+      title: t("map.routeNoGeoTitle"),
+      text: t("map.routeNoGeoText"),
+      action: { label: t("actions.showTable"), run: () => setView("query") }
+    });
   } else if (!map.hasContent()) {
     setMapEmpty({
       title: t("map.routeOutsideTitle"),
@@ -763,6 +1074,38 @@ function drawRoutes({ fit = false } = {}) {
   }
 }
 
+// Mark the steps of each selected kadı that pass the sidebar filters (place,
+// direction, degree, type). The filter set is the server's, so a route shows
+// exactly the records the table lists for that kadı.
+async function refreshRouteMatches() {
+  const request = ++state.matchRequest;
+  const entries = [...state.persons];
+
+  if (!entries.length) return;
+
+  if (!hasStepFilters()) {
+    for (const entry of entries) entry.matched = null;
+  } else {
+    const filters = stepFilters();
+    try {
+      const results = await Promise.all(
+        entries.map((entry) => getAppointmentIds({ ...filters, person_id: entry.person.id })));
+      if (request !== state.matchRequest) return;
+      entries.forEach((entry, index) => {
+        entry.matched = results[index].ids;
+      });
+    } catch (error) {
+      if (request !== state.matchRequest) return;
+      console.error(error);
+      for (const entry of entries) entry.matched = null;
+      toast(t("errors.matchLoad"), "error");
+    }
+  }
+
+  drawRoutes();
+  if (state.detail.kind === "person") renderDetail();
+}
+
 function renderMapHeading() {
   const count = state.persons.length;
 
@@ -770,29 +1113,34 @@ function renderMapHeading() {
     const active = activeEntry();
     const records = state.persons.reduce((sum, { person }) => sum + person.appointments.length, 0);
     const { from, to } = effectiveWindow();
+    const filtered = hasStepFilters() ? describeFilters({ bare: true }) : "";
 
     els.mapEyebrow.textContent = t("map.routeEyebrow");
     els.mapTitle.textContent = count > 1 ? t("map.compareTitle", { count }) : active?.person.name ?? "";
-    els.mapSubtitle.textContent = isFullRange()
-      ? t("map.routeSubtitle")
-      : t("map.routeWindow", { from: from ?? "…", to: to ?? "…" });
+    els.mapSubtitle.textContent = [
+      isFullRange()
+        ? t("map.routeSubtitle")
+        : t("map.routeWindow", { from: from != null ? formatYear(from) : "…", to: to != null ? formatYear(to) : "…" }),
+      filtered ? t("map.routeFiltered", { filters: filtered }) : ""
+    ].filter(Boolean).join(" · ");
     els.resultCount.textContent = t("map.recordCount", { count: formatNumber(records) });
     return;
   }
 
-  const { from, to } = effectiveWindow();
-  const parts = [];
-
-  if (!isFullRange() && from != null && to != null) parts.push(t("map.years", { from, to }));
-  if (state.degree) parts.push(state.degree);
-  if (state.positionType) parts.push(state.positionType);
-  if (state.place) parts.push(state.place.name);
-
   els.mapEyebrow.textContent = t("map.eyebrow");
-  els.mapTitle.textContent = state.mapMode === "flows" ? t("map.title") : t("map.placesTitle");
-  els.mapSubtitle.textContent = parts.length
-    ? t("map.filteredBy", { filters: parts.join(" · ") })
-    : t("map.subtitle");
+
+  if (state.place) {
+    const place = placeLabel(state.place);
+    const key = state.direction || "any";
+    els.mapTitle.textContent = t(`map.placeFocusTitle.${key}`, { place });
+    els.mapSubtitle.textContent = [
+      t(state.mapMode === "flows" ? "map.placeFocusFlows" : "map.placeFocusPoints"),
+      describeFilters({ withPlace: false }) === t("query.noFilters") ? "" : describeFilters({ withPlace: false })
+    ].filter(Boolean).join(" · ");
+  } else {
+    els.mapTitle.textContent = state.mapMode === "flows" ? t("map.title") : t("map.placesTitle");
+    els.mapSubtitle.textContent = hasActiveFilters() ? describeFilters() : t("map.subtitle");
+  }
 
   const counted = state.lastCount;
 
@@ -816,13 +1164,22 @@ function renderLegend() {
     const entry = activeEntry();
     if (!entry) return;
 
-    const ramp = el("span", { class: "legend-ramp", "aria-hidden": "true" });
-    ramp.style.background = routeGradient(entry.hue);
+    const color = routeColor(entry.hue, 0.78);
+    const pill = el("span", { class: "legend-pill", "aria-hidden": "true" }, "3·21");
+    pill.style.background = color;
+    const solid = el("span", { class: "legend-line", "aria-hidden": "true" });
+    solid.style.borderTopColor = color;
+    const dashed = el("span", { class: "legend-line is-dashed", "aria-hidden": "true" });
+    dashed.style.borderTopColor = color;
 
     legend.append(
-      el("div", {}, t("route.first"), ramp, t("route.last")),
-      el("div", {}, el("span", { class: "legend-number", "aria-hidden": "true" }, "1"), t("map.legendOrder"))
+      el("div", {}, pill, t("map.legendStops")),
+      el("div", {}, solid, t("map.legendLinked")),
+      el("div", {}, dashed, t("map.legendGap"))
     );
+    if (state.persons.some((item) => item.matched)) {
+      legend.append(el("div", {}, el("span", { class: "legend-line is-faded", "aria-hidden": "true" }), t("map.legendUnmatched")));
+    }
     // route arrows only fade while the timeline is narrowed
     if (!isFullRange()) legend.append(legendAge());
     return;
@@ -840,6 +1197,10 @@ function renderLegend() {
         el("span", { class: "legend-dots", "aria-hidden": "true" }, el("i"), el("i"), el("i")),
         t("map.legendPoints"))
     );
+  }
+
+  if (focusKey()) {
+    legend.append(el("div", {}, el("span", { class: "legend-focus", "aria-hidden": "true" }), t("map.legendFocus")));
   }
 }
 
@@ -896,8 +1257,10 @@ function handleMapSelection(selection) {
 
 /* ---------- persons ---------- */
 
-async function addPerson(id) {
-  setView("map");
+// `stay`: keep the current view (e.g. a kadı picked in the query table is
+// added to the selection and opened in the panel, the table stays).
+async function addPerson(id, { stay = false } = {}) {
+  if (!stay) setView("map");
 
   if (state.persons.some((entry) => entry.person.id === id)) {
     activatePerson(id);
@@ -936,6 +1299,8 @@ async function addPerson(id) {
     renderMapMode();
     writeHash();
     refreshMap({ fit: true });
+    refreshRouteMatches();
+    queryView.invalidate();
   } catch (error) {
     console.error(error);
     toast(error.status === 404 ? t("errors.notFound") : t("errors.personLoad"), "error");
@@ -995,6 +1360,8 @@ function afterPersonsChanged() {
   renderMapMode();
   writeHash();
   refreshMap({ fit: true });
+  refreshRouteMatches();
+  queryView.invalidate();
 }
 
 function activeEntry() {
@@ -1010,7 +1377,7 @@ function renderPersonChips() {
     const active = person.id === state.activePersonId;
     const item = el("li", { class: active ? "person-chip is-active" : "person-chip" });
 
-    item.style.setProperty("--chip-ramp", routeGradient(hue));
+    item.style.setProperty("--chip-ramp", routeColor(hue, 0.78));
     item.style.setProperty("--chip-color", routeColor(hue, 0.85));
 
     const select = el(
@@ -1065,7 +1432,10 @@ function renderDetail() {
       tabs = renderPersonHeader();
       break;
     case "place":
-      tabs = renderPlaceHeader(detail.place);
+      tabs = renderPlaceHeader(detail);
+      break;
+    case "placeGroup":
+      tabs = renderPlaceGroupHeader(detail);
       break;
     case "flow":
       tabs = renderFlowHeader(detail);
@@ -1148,7 +1518,7 @@ function renderOverview() {
     label: t("details.overview"),
     render: () => {
       const steps = el("ol", { class: "guide-list" },
-        ...["search", "compare", "time", "source"].map((key) =>
+        ...["search", "place", "compare", "time", "query", "source"].map((key) =>
           el("li", {}, el("strong", {}, t(`guide.${key}Title`)), el("span", {}, t(`guide.${key}`))))
       );
 
@@ -1166,15 +1536,12 @@ function renderPersonHeader() {
   const entry = activeEntry();
   if (!entry) return renderOverview();
 
-  const { person, hue } = entry;
+  const { person, matched } = entry;
   const appointments = person.appointments;
   const dated = appointments.filter((a) => a.year_numeric != null);
-  const places = new Set();
-
-  for (const a of appointments) {
-    if (a.origin && a.role !== "departed") places.add(a.origin_place_id ?? `raw:${a.origin}`);
-    if (a.destination) places.add(a.destination_place_id ?? `raw:${a.destination}`);
-  }
+  const { stops, stopOf } = buildItinerary(appointments);
+  const places = new Set(stops.map((stop) => stop.key));
+  const drawn = stops.filter(hasPoint).length;
 
   els.detailEyebrow.textContent = t("details.person");
   els.detailTitle.textContent = person.name;
@@ -1187,11 +1554,11 @@ function renderPersonHeader() {
   renderSummary([
     [t("details.appointments"), formatNumber(appointments.length)],
     [t("details.placesVisited"), formatNumber(places.size)],
-    [t("details.firstRecord"), dated[0]?.year_label ?? "—"],
-    [t("details.lastRecord"), dated.at(-1)?.year_label ?? "—"]
+    [t("details.onMap"), `${formatNumber(drawn)} / ${formatNumber(stops.length)}`],
+    [t("details.span"), dated.length ? `${dateLabel(dated[0])} – ${dateLabel(dated.at(-1))}` : "—"]
   ]);
 
-  if (appointments.some(isDrawable)) {
+  if (drawn) {
     const focus = el("button", { type: "button", class: "secondary-button compact" }, t("actions.focusRoute"));
     focus.addEventListener("click", () => {
       setView("map");
@@ -1201,99 +1568,113 @@ function renderPersonHeader() {
     els.detailActions.append(focus);
   }
 
+  const table = el("button", { type: "button", class: "secondary-button compact" }, t("actions.showTable"));
+  table.addEventListener("click", () => setView("query"));
+  els.detailActions.append(table);
+
   if (person.wikidata_qid) {
     els.detailActions.append(externalLink(`https://www.wikidata.org/wiki/${encodeURIComponent(person.wikidata_qid)}`, "Wikidata"));
   }
 
   return [
-    { id: "route", label: t("details.route"), render: () => renderItinerary(person, hue) },
-    { id: "appointments", label: t("details.appointments"), render: () => renderAppointmentList(appointments, hue) }
+    { id: "route", label: t("details.route"), render: () => renderItinerary(entry) },
+    {
+      id: "appointments",
+      label: t("details.appointments"),
+      render: () => {
+        if (matched) els.detailBody.append(matchNote(matched, appointments));
+        renderAppointmentList(appointments, { stopOf, matched });
+      }
+    }
   ];
+}
+
+function matchNote(matched, appointments) {
+  const count = appointments.filter((a) => matched.has(a.id)).length;
+  return el("p", { class: "detail-note is-match-note" },
+    t("route.matchNote", { count: formatNumber(count), total: formatNumber(appointments.length), filters: describeFilters({ bare: true }) }));
 }
 
 // The places a kadı passed through, in itinerary order (A → B → C …). The API
 // already ordered the steps along the old place → new place chain; a new
 // start is only added where that chain breaks.
-function renderItinerary(person, hue) {
-  const appointments = person.appointments;
+// The kadı's stops, numbered exactly like the badges on the map. A place
+// visited twice appears twice; stops without coordinates are listed but
+// flagged, and gaps in the record get their own row.
+function renderItinerary(entry) {
+  const { person, hue, matched } = entry;
+  const { stops } = buildItinerary(person.appointments);
 
-  if (!appointments.length) {
+  if (!stops.length) {
     els.detailBody.append(emptyBlock(t("details.noAppointments")));
     return;
   }
 
+  const color = routeColor(hue, 0.78);
   const list = el("ol", { class: "route-list" });
-  const count = appointments.length;
-  let position = 0;
 
-  const addStop = ({ name, placeId, label, at, gap = false }) => {
-    position += 1;
+  for (const stop of stops) {
+    if (stop.gap) list.append(el("li", { class: "route-gap" }, t("route.gapRow")));
 
-    const item = el("li", { class: gap ? "route-stop is-gap" : "route-stop" });
-    item.style.setProperty("--step-color", routeColor(hue, at));
-
-    const marker = el("span", { class: "route-marker", "aria-hidden": "true" }, String(position));
-    const text = el("span", { class: "route-text" },
-      el("strong", {}, name ?? t("common.unknownPlace")),
-      el("span", {}, label));
-
-    if (placeId != null) {
-      const button = el("button", { type: "button", class: "route-stop-button", title: t("route.showOnMap") }, marker, text);
-      button.addEventListener("click", () => {
-        setView("map");
-        map.highlight(`place:${placeId}`);
-      });
-      item.append(button);
-    } else {
-      item.append(el("div", { class: "route-stop-button" }, marker, text));
-    }
-
-    list.append(item);
-  };
-
-  appointments.forEach((appointment, index) => {
-    const breaks = index === 0 || appointment.follows_previous === false;
-    const year = appointment.year_label ?? t("time.unknown");
-
-    // leaving a post is an event at a place, not a journey of this kadı
-    if (appointment.role === "departed") {
-      if (index > 0 && breaks) list.append(el("li", { class: "route-gap" }, t("route.gapRow")));
-
-      if (breaks) {
-        addStop({
-          name: appointment.destination,
-          placeId: appointment.destination_place_id,
-          label: t("route.departedAt", { year }),
-          at: arrivalPosition(index, count),
-          gap: index > 0
-        });
-      } else {
-        list.append(el("li", { class: "route-event" }, successorLine(appointment, year)));
-      }
-      return;
-    }
-
-    if (breaks) {
-      if (index > 0) list.append(el("li", { class: "route-gap" }, t("route.gapRow")));
-
-      addStop({
-        name: appointment.origin,
-        placeId: appointment.origin_place_id,
-        label: index === 0 ? t("route.start") : t("route.restart"),
-        at: departurePosition(index, count),
-        gap: index > 0
-      });
-    }
-
-    addStop({
-      name: appointment.destination,
-      placeId: appointment.destination_place_id,
-      label: t("route.arrived", { year }),
-      at: arrivalPosition(index, count)
+    const hit = !matched || matched.has(stop.appointment.id) || stop.events.some((e) => matched.has(e.id));
+    const item = el("li", {
+      class: ["route-stop", matched && !hit ? "is-dim" : "", matched && hit ? "is-match" : ""].filter(Boolean).join(" ")
     });
-  });
+    item.style.setProperty("--step-color", color);
 
-  els.detailBody.append(el("p", { class: "detail-note" }, t("route.help")), list);
+    const marker = el("span", { class: "route-marker", "aria-hidden": "true" }, String(stop.n));
+    const text = el("span", { class: "route-text" },
+      el("strong", {}, stop.name ?? t("common.unknownPlace")),
+      el("span", {}, stopLabel(stop)),
+      hasPoint(stop) ? null : el("span", { class: "route-nomap" }, t("route.notOnMap")));
+
+    const button = el("button", {
+      type: "button",
+      class: "route-stop-button",
+      title: hasPoint(stop) ? t("route.showOnMap") : t("route.openRecord"),
+      "aria-label": `${t("route.stopNo", { n: stop.n })}: ${stop.name ?? t("common.unknownPlace")}, ${stopLabel(stop)}`
+    }, marker, text);
+
+    button.addEventListener("click", () => {
+      if (hasPoint(stop) && stop.placeId != null) {
+        setView("map");
+        map.highlight(`place:${stop.placeId}`);
+      }
+      openRecord({ appointment: stop.appointment });
+    });
+
+    item.append(button);
+    list.append(item);
+
+    for (const event of stop.events) {
+      list.append(el("li", { class: "route-event" }, successorLine(event, dateLabel(event) ?? t("time.unknown"))));
+    }
+  }
+
+  els.detailBody.append(...[
+    el("p", { class: "detail-note" }, t("route.help")),
+    matched ? matchNote(matched, person.appointments) : null,
+    list
+  ].filter(Boolean));
+}
+
+function stopLabel(stop) {
+  const year = dateLabel(stop.appointment) ?? t("time.unknown");
+
+  switch (stop.kind) {
+    case "start":
+      return t("route.start");
+    case "restart":
+      return t("route.restart");
+    case "departed":
+      return t("route.departedAt", { year });
+    default:
+      return t("route.arrived", { year });
+  }
+}
+
+function dateLabel(appointment) {
+  return formatDate(appointment?.year_numeric, appointment?.year_label);
 }
 
 function successorLine(appointment, year) {
@@ -1301,39 +1682,40 @@ function successorLine(appointment, year) {
   return name ? t("route.leftPost", { year, successor: name }) : t("route.departedAt", { year });
 }
 
-function renderAppointmentList(appointments, hue = null) {
+// `stopOf` (a kadı's own list) names each record's stop number on the route;
+// `matched` dims the records outside the sidebar filters.
+function renderAppointmentList(appointments, { stopOf = null, matched = null } = {}) {
   if (!appointments.length) {
     els.detailBody.append(emptyBlock(t("details.noAppointments")));
     return;
   }
 
+  const own = stopOf !== null;
   const list = el("ol", { class: "detail-list" });
 
   appointments.forEach((appointment, index) => {
-    const brokenChain = hue !== null && index > 0 && appointment.follows_previous === false;
+    const brokenChain = own && index > 0 && appointment.follows_previous === false;
     const selected = state.record?.appointment?.id === appointment.id;
+    const dim = matched && !matched.has(appointment.id);
 
     const row = el("li", {
-      class: ["detail-row", brokenChain ? "is-gap" : "", selected ? "is-selected" : ""].filter(Boolean).join(" ")
+      class: ["detail-row", brokenChain ? "is-gap" : "", selected ? "is-selected" : "", dim ? "is-dim" : ""].filter(Boolean).join(" ")
     });
 
-    if (hue !== null) {
-      row.style.setProperty("--step-color", routeColor(hue, stepPosition(index, appointments.length)));
-    }
-
+    const stop = own ? stopOf.get(appointment.id) : null;
     const time = el("span", { class: "detail-row-time" },
-      [appointment.sequence ? `#${appointment.sequence}` : null, appointment.year_label ?? t("time.unknown")]
+      [stop ? t("route.stopNo", { n: stop }) : null, dateLabel(appointment) ?? t("time.unknown")]
         .filter(Boolean).join(" · "));
 
     if (brokenChain) time.append(" ", el("em", { class: "chain-gap", title: t("route.gapRow") }, t("route.gap")));
 
-    const departed = hue !== null && appointment.role === "departed";
+    const departed = own && appointment.role === "departed";
     const oldName = appointment.old_person?.name ?? appointment.raw_old_kadi;
     const newName = appointment.new_person?.name ?? appointment.raw_new_kadi;
 
     // in a kadı's own list, name the other party; elsewhere, both of them
     const people =
-      hue === null
+      !own
         ? oldName || newName ? `${oldName ?? "—"} → ${newName ?? "—"}` : null
         : departed
           ? newName ? t("route.successor", { name: newName }) : null
@@ -1361,7 +1743,9 @@ function renderAppointmentList(appointments, hue = null) {
 
 /* place */
 
-async function showPlace(id) {
+// `push: false` when the detail is being restored from the URL, so reopening
+// a link does not add a history entry of its own.
+async function showPlace(id, { push = true } = {}) {
   const request = ++state.detailRequest;
   showLoadingDetail(t("details.loadingPlace"));
 
@@ -1371,7 +1755,9 @@ async function showPlace(id) {
 
     state.record = null;
     map.highlight(`place:${place.id}`);
-    setDetail({ kind: "place", place }, "persons");
+    setDetail({ kind: "place", place, persons: null }, "persons");
+    writeHash({ push });
+    loadPlacePersons();
   } catch (error) {
     if (request !== state.detailRequest) return;
     console.error(error);
@@ -1380,22 +1766,130 @@ async function showPlace(id) {
   }
 }
 
-function renderPlaceHeader(place) {
+// Every place whose name starts with the prefix of the place filter.
+function showPlaceGroup(prefix = state.place?.prefix, { push = true } = {}) {
+  if (!prefix) return;
+
+  state.detailRequest += 1;
+  state.record = null;
+  const detail = { kind: "placeGroup", prefix, persons: null, places: null };
+  setDetail(detail, "persons");
+  openDetails();
+  writeHash({ push });
+  loadPlacePersons();
+  loadGroupPlaces(detail);
+}
+
+// The kadıs of a place (or name group) under the current filters — the same
+// records the map and the table show for it. With a direction filter only the
+// kadıs who moved (the incoming kadı of each record) are listed.
+async function loadPlacePersons() {
+  const detail = state.detail;
+  if (detail.kind !== "place" && detail.kind !== "placeGroup") return;
+
+  const token = (detail.personsToken ?? 0) + 1;
+  detail.personsToken = token;
+
+  const own = detail.kind === "place" ? { id: detail.place.id } : { prefix: detail.prefix };
+  const filters = queryFilters();
+  delete filters.place_id;
+  delete filters.place_prefix;
+  delete filters.direction;
+  if (own.id != null) filters.place_id = own.id;
+  else filters.place_prefix = own.prefix;
+  if (samePlace(state.place, own) && state.direction) filters.direction = state.direction;
+
+  const by = filters.direction ? "new_kadi" : "person";
+  const both = { ...filters };
+  delete both.direction;
+
+  try {
+    // the panel's numbers all come from the same filtered records as its list
+    const [stats, arrivals, departures] = await Promise.all([
+      getStats(by, { ...filters, limit: PLACE_PERSONS_LIMIT }),
+      getSummary({ ...both, direction: "arrival" }),
+      getSummary({ ...both, direction: "departure" })
+    ]);
+    if (state.detail !== detail || detail.personsToken !== token) return;
+    detail.persons = { ...stats, direction: filters.direction ?? "" };
+    detail.counts = { arrivals: arrivals.records, departures: departures.records };
+  } catch (error) {
+    if (state.detail !== detail || detail.personsToken !== token) return;
+    console.error(error);
+    detail.persons = { error };
+  }
+
+  renderDetail();
+}
+
+async function loadGroupPlaces(detail) {
+  try {
+    const places = await searchPlaces(detail.prefix, { match: "prefix", limit: 100 });
+    if (state.detail !== detail) return;
+    detail.places = places;
+  } catch (error) {
+    if (state.detail !== detail) return;
+    console.error(error);
+    detail.places = { error };
+  }
+  renderDetail();
+}
+
+function renderPlaceHeader(detail) {
+  const place = detail.place;
+
   els.detailEyebrow.textContent = t("details.place");
   els.detailTitle.textContent = place.name;
   els.detailSubtitle.textContent =
     place.latitude != null && place.longitude != null
       ? `${formatCoordinate(place.latitude, "N", "S")}, ${formatCoordinate(place.longitude, "E", "W")}`
-      : t("common.noCoordinates");
+      : t("details.placeNoCoordinates");
 
   renderSummary([
-    [t("details.arrivals"), formatNumber(place.inbound)],
-    [t("details.departures"), formatNumber(place.outbound)],
-    [t("details.distinctPersons"), formatNumber(place.distinct_persons)],
+    [t("details.arrivals"), detail.counts ? formatNumber(detail.counts.arrivals) : "…"],
+    [t("details.departures"), detail.counts ? formatNumber(detail.counts.departures) : "…"],
+    [t("details.distinctPersons"), detail.persons?.groups != null ? formatNumber(detail.persons.groups) : "…"],
     [t("details.wikidata"), place.wikidata_qid ?? "—"]
   ]);
 
-  const filtered = state.place?.id === place.id;
+  const own = { id: place.id, name: place.name, hasCoordinates: place.latitude != null };
+  renderPlaceActions(own);
+
+  if (place.wikidata_qid) {
+    els.detailActions.append(externalLink(`https://www.wikidata.org/wiki/${encodeURIComponent(place.wikidata_qid)}`, "Wikidata"));
+  }
+
+  return [
+    { id: "persons", label: t("details.persons"), render: () => renderPlacePersons(detail) },
+    { id: "names", label: t("details.names"), render: () => renderPlaceNames(place) }
+  ];
+}
+
+function renderPlaceGroupHeader(detail) {
+  const places = Array.isArray(detail.places) ? detail.places : null;
+
+  els.detailEyebrow.textContent = t("details.placeGroup");
+  els.detailTitle.textContent = t("filters.prefixLabel", { prefix: detail.prefix });
+  els.detailSubtitle.textContent = t("details.placeGroupNote");
+
+  renderSummary([
+    [t("dataset.places"), places ? formatNumber(places.length) : "…"],
+    [t("details.arrivals"), detail.counts ? formatNumber(detail.counts.arrivals) : "…"],
+    [t("details.departures"), detail.counts ? formatNumber(detail.counts.departures) : "…"],
+    [t("details.distinctPersons"), detail.persons?.groups != null ? formatNumber(detail.persons.groups) : "…"]
+  ]);
+
+  renderPlaceActions({ prefix: detail.prefix, name: detail.prefix });
+
+  return [
+    { id: "persons", label: t("details.persons"), render: () => renderPlacePersons(detail) },
+    { id: "places", label: t("details.groupPlaces"), render: () => renderGroupPlaces(detail) }
+  ];
+}
+
+// "Filter by this place" + "show in table" for a place or a name group.
+function renderPlaceActions(own) {
+  const filtered = samePlace(state.place, own);
   const filter = el("button", {
     type: "button",
     class: filtered ? "secondary-button compact is-on" : "secondary-button compact",
@@ -1403,37 +1897,54 @@ function renderPlaceHeader(place) {
   }, filtered ? t("actions.removePlaceFilter") : t("actions.filterByPlace"));
 
   filter.addEventListener("click", () => {
-    setPlaceFilter(filtered ? null : { id: place.id, name: place.name });
+    setPlaceFilter(filtered ? null : own);
     renderDetail();
   });
-  els.detailActions.append(filter);
 
-  if (place.wikidata_qid) {
-    els.detailActions.append(externalLink(`https://www.wikidata.org/wiki/${encodeURIComponent(place.wikidata_qid)}`, "Wikidata"));
-  }
+  const table = el("button", { type: "button", class: "secondary-button compact" }, t("actions.showTable"));
+  table.addEventListener("click", () => {
+    setPlaceFilter(own);
+    setView("query");
+  });
 
-  return [
-    { id: "persons", label: t("details.persons"), render: () => renderRelatedPersons(place) },
-    { id: "names", label: t("details.names"), render: () => renderPlaceNames(place) }
-  ];
+  els.detailActions.append(filter, table);
 }
 
-function renderRelatedPersons(place) {
-  if (!place.related_persons.length) {
+function renderPlacePersons(detail) {
+  const data = detail.persons;
+
+  if (!data) {
+    els.detailBody.append(loadingBlock());
+    return;
+  }
+
+  if (data.error) {
+    const retry = el("button", { type: "button", class: "text-button" }, t("actions.retry"));
+    retry.addEventListener("click", () => loadPlacePersons());
+    els.detailBody.append(el("div", { class: "detail-empty" }, t("errors.placeLoad"), " ", retry));
+    return;
+  }
+
+  const filters = describeFilters({ withPlace: false });
+  els.detailBody.append(el("p", { class: "detail-note" },
+    t(data.direction ? `details.personsBy.${data.direction}` : "details.personsBy.any", {
+      count: formatNumber(data.groups),
+      records: formatNumber(data.records)
+    }),
+    filters === t("query.noFilters") ? "" : ` ${filters}`));
+
+  if (!data.items.length) {
     els.detailBody.append(emptyBlock(t("details.noPersons")));
     return;
   }
 
   const list = el("ul", { class: "person-list" });
 
-  for (const person of place.related_persons) {
+  for (const person of data.items) {
     const added = state.persons.some((entry) => entry.person.id === person.id);
     const button = el("button", { type: "button", class: "person-list-button" },
-      el("strong", {}, person.name),
-      el("span", {}, [
-        person.arrived_here ? t("details.arrivedCount", { count: person.arrived_here }) : null,
-        person.left_here ? t("details.leftCount", { count: person.left_here }) : null
-      ].filter(Boolean).join(" · ")),
+      el("strong", {}, person.label ?? "—"),
+      el("span", {}, t("details.recordCount", { count: formatNumber(person.count) })),
       el("span", { class: added ? "person-list-action is-added" : "person-list-action" },
         added ? t("persons.onMap") : t("persons.showRoute")));
 
@@ -1443,9 +1954,41 @@ function renderRelatedPersons(place) {
 
   els.detailBody.append(list);
 
-  if (place.related_persons.length >= 50) {
-    els.detailBody.append(el("p", { class: "detail-note" }, t("details.personsCapped")));
+  if (data.groups > data.items.length) {
+    els.detailBody.append(el("p", { class: "detail-note" },
+      t("details.personsCapped", { shown: formatNumber(data.items.length), total: formatNumber(data.groups) })));
   }
+}
+
+function renderGroupPlaces(detail) {
+  const places = detail.places;
+
+  if (!places) {
+    els.detailBody.append(loadingBlock());
+    return;
+  }
+
+  if (places.error) {
+    els.detailBody.append(emptyBlock(t("errors.placeLoad")));
+    return;
+  }
+
+  const list = el("ul", { class: "person-list" });
+
+  for (const place of places) {
+    const button = el("button", { type: "button", class: "person-list-button" },
+      el("strong", {}, place.name),
+      el("span", {}, [
+        t("appointments.count", { count: formatNumber(place.appointment_count) }),
+        place.latitude == null ? t("common.noCoordinates") : null
+      ].filter(Boolean).join(" · ")),
+      el("span", { class: "person-list-action" }, t("actions.open")));
+
+    button.addEventListener("click", () => showPlace(place.id));
+    list.append(el("li", {}, button));
+  }
+
+  els.detailBody.append(list);
 }
 
 function renderPlaceNames(place) {
@@ -1471,10 +2014,11 @@ function renderPlaceNames(place) {
 
 /* flow */
 
-function showFlow(flow) {
+function showFlow(flow, { push = true } = {}) {
   state.record = null;
   setDetail({ kind: "flow", flow, appointments: null, total: 0, error: null }, "appointments");
   openDetails();
+  writeHash({ push });
   loadFlowDetail(flow);
 }
 
@@ -1492,6 +2036,9 @@ async function loadFlowDetail(flow) {
     });
 
     if (request !== state.detailRequest || state.detail.flow !== flow) return;
+    // a flow restored from a link only knows its place ids
+    if (!flow.origin && items[0]) flow.origin = items[0].origin ?? "";
+    if (!flow.destination && items[0]) flow.destination = items[0].destination ?? "";
     setDetail({ kind: "flow", flow, appointments: items, total, error: null }, state.tab);
   } catch (error) {
     if (request !== state.detailRequest || state.detail.flow !== flow) return;
@@ -1536,9 +2083,10 @@ function renderFlowHeader(detail) {
 
 /* record: one source row and the appointment derived from it */
 
-async function openRecord({ appointment = null, sourceId = null }) {
+async function openRecord({ appointment = null, sourceId = null, push = true }) {
   const id = sourceId ?? appointment?.source_record_id ?? null;
   const request = ++state.recordRequest;
+  const withSource = canSeeSources();
 
   if (appointment) map.highlight(`appointment:${appointment.id}`);
 
@@ -1546,12 +2094,13 @@ async function openRecord({ appointment = null, sourceId = null }) {
   state.tab = "record";
   renderDetail();
   openDetails();
+  writeHash({ push });
 
   if (id == null) return;
 
   try {
     const [source, linked] = await Promise.all([
-      getSource(id),
+      withSource ? getSource(id) : null,
       appointment ? null : getAppointments({ source_record_id: id, limit: 5 })
     ]);
 
@@ -1573,10 +2122,10 @@ async function openRecord({ appointment = null, sourceId = null }) {
   renderDetail();
 }
 
-function openSourceRecord(sourceId) {
+function openSourceRecord(sourceId, { push = true } = {}) {
   state.detailRequest += 1;
   state.detail = { kind: "record" };
-  openRecord({ sourceId });
+  openRecord({ sourceId, push });
 }
 
 function renderRecordHeader() {
@@ -1611,6 +2160,9 @@ function renderRecordPanel() {
     };
 
     add(t("record.date"), appointment.year_label);
+    if (appointment.year_numeric != null) {
+      add(t("record.gregorian"), formatDate(appointment.year_numeric, null, "gregorian"));
+    }
     add(t("record.calendar"), calendarLabel(appointment.calendar));
     add(t("record.oldKadi"), personLink(appointment.old_person, appointment.raw_old_kadi));
     add(t("record.newKadi"), personLink(appointment.new_person, appointment.raw_new_kadi));
@@ -1627,7 +2179,9 @@ function renderRecordPanel() {
     section.append(fields);
   }
 
-  if (record.loading) {
+  if (!canSeeSources()) {
+    section.append(el("p", { class: "detail-note" }, t("source.adminOnly")));
+  } else if (record.loading) {
     section.append(loadingBlock());
   } else if (record.error) {
     const retry = el("button", { type: "button", class: "text-button" }, t("actions.retry"));
@@ -1723,12 +2277,14 @@ function updateFab() {
 /* ---------- views ---------- */
 
 function setView(view) {
-  if (!["map", "sources"].includes(view)) return;
+  if (!VIEWS.includes(view)) return;
+  if (view === "sources" && !canSeeSources()) view = "map";
 
   const changed = state.view !== view;
 
   state.view = view;
   els.mapView.hidden = view !== "map";
+  els.queryView.hidden = view !== "query";
   els.sourcesView.hidden = view !== "sources";
 
   for (const button of els.navItems) {
@@ -1738,8 +2294,11 @@ function setView(view) {
     else button.removeAttribute("aria-current");
   }
 
+  if (view !== "map") stopPlayback();
+
+  if (view === "query") queryView.activate();
+
   if (view === "sources") {
-    stopPlayback();
     if (!state.sources.loaded && !state.sources.loading) runSourceSearch({ reset: true });
     if (changed) els.sourcesQuery.focus({ preventScroll: true });
   }
@@ -1755,6 +2314,8 @@ async function runSourceSearch({ reset }) {
     sources.offset = 0;
     sources.items = [];
     sources.total = 0;
+    // typing should not leave one history entry per keystroke
+    writeHash({ push: false });
   }
 
   sources.controller?.abort();
@@ -1910,7 +2471,7 @@ function setupCombobox({ input, list, search, describe, onPick, errorMessage, mi
       const option = el("div", {
         role: "option",
         id: `${list.id}-option-${index}`,
-        class: info.added ? "search-result is-added" : "search-result",
+        class: ["search-result", info.added ? "is-added" : "", info.group ? "is-group" : ""].filter(Boolean).join(" "),
         "aria-selected": "false"
       },
         el("span", { class: "search-result-label" }, info.label),
@@ -1986,29 +2547,133 @@ function setupCombobox({ input, list, search, describe, onPick, errorMessage, mi
 
 /* ---------- shareable state in the URL hash ---------- */
 
-function writeHash() {
+// Everything needed to rebuild the screen lives in the URL hash, so the
+// browser's Back button returns to the previous screen with its filters and
+// a link reproduces it. Several writes in one tick become one history entry.
+let hashWrite = null;
+
+function writeHash({ push = true } = {}) {
   if (!state.meta) return;
 
+  if (hashWrite) {
+    hashWrite.push ||= push;
+    return;
+  }
+
+  hashWrite = { push };
+  queueMicrotask(() => {
+    const { push: wantPush } = hashWrite;
+    hashWrite = null;
+    commitHash(wantPush && !state.restoring);
+  });
+}
+
+function commitHash(push) {
   const params = new URLSearchParams();
+  const meta = state.meta;
 
   if (state.view !== "map") params.set("view", state.view);
   if (state.persons.length) params.set("k", state.persons.map((entry) => entry.person.id).join(","));
   if (state.persons.length > 1 && state.activePersonId != null) params.set("a", state.activePersonId);
   if (state.mapMode !== "flows") params.set("m", state.mapMode);
-  if (state.yearFrom != null && state.yearFrom !== state.meta.min_year) params.set("from", state.yearFrom);
-  if (state.yearTo != null && state.yearTo !== state.meta.max_year) params.set("to", state.yearTo);
+  if (state.yearFrom != null && state.yearFrom !== meta.min_year) params.set("from", state.yearFrom);
+  if (state.yearTo != null && state.yearTo !== meta.max_year) params.set("to", state.yearTo);
   if (state.degree) params.set("degree", state.degree);
   if (state.positionType) params.set("type", state.positionType);
-  if (state.place) params.set("place", `${state.place.id}:${state.place.name}`);
+  if (state.place?.id != null) params.set("place", `${state.place.id}:${state.place.name}`);
+  if (state.place?.prefix) params.set("pp", state.place.prefix);
+  if (state.place && state.direction) params.set("dir", state.direction);
+
+  const detail = detailToken();
+  if (detail) params.set("d", detail);
+  if (state.record?.sourceId != null) params.set("r", state.record.sourceId);
+
+  if (state.view === "query") {
+    const query = queryView.getState();
+    if (query.mode !== "table") params.set("qm", query.mode);
+    if (query.page) params.set("qp", query.page);
+    if (query.sort !== "year") params.set("qs", query.sort);
+    if (query.top !== 10) params.set("qt", query.top);
+  }
+  if (state.view === "sources" && state.sources.q) params.set("sq", state.sources.q);
 
   const hash = params.toString() ? `#${params}` : "";
   state.lastHash = hash;
 
-  if (hash !== location.hash) {
-    history.replaceState(null, "", `${location.pathname}${location.search}${hash}`);
+  if (hash === location.hash) return;
+
+  const url = `${location.pathname}${location.search}${hash}`;
+  if (push) {
+    state.historyIndex += 1;
+    history.pushState({ kadiIndex: state.historyIndex }, "", url);
+  } else {
+    history.replaceState({ kadiIndex: state.historyIndex }, "", url);
+  }
+  updateBackButton();
+}
+
+// The open detail, when it is not implied by the selected kadıs.
+function detailToken() {
+  switch (state.detail.kind) {
+    case "place":
+      return `place:${state.detail.place.id}`;
+    case "placeGroup":
+      return `group:${state.detail.prefix}`;
+    case "flow":
+      return `flow:${state.detail.flow.origin_id}-${state.detail.flow.destination_id}`;
+    case "record":
+      return state.record?.sourceId != null ? "record" : null;
+    default:
+      return null;
   }
 }
 
+function updateBackButton() {
+  els.detailBack.hidden = state.historyIndex <= 0;
+}
+
+async function restoreAndRender() {
+  state.restoring = true;
+
+  try {
+    const detail = await restoreFromHash();
+    syncFilterInputs();
+    renderDetail();
+    refreshMap({ fit: true });
+    refreshRouteMatches();
+    queryView.invalidate();
+    restoreDetail(detail);
+  } finally {
+    // writes queued while restoring replace the entry instead of adding one
+    queueMicrotask(() => {
+      state.restoring = false;
+    });
+  }
+}
+
+async function restoreDetail({ token, record }) {
+  const split = token?.indexOf(":") ?? -1;
+  const kind = split > 0 ? token.slice(0, split) : token;
+  const value = split > 0 ? token.slice(split + 1) : null;
+  const quiet = { push: false };
+
+  if (kind === "place" && Number(value) > 0) {
+    await showPlace(Number(value), quiet);
+  } else if (kind === "group" && value) {
+    showPlaceGroup(value, quiet);
+  } else if (kind === "flow" && /^\d+-\d+$/.test(value ?? "")) {
+    const [origin, destination] = value.split("-").map(Number);
+    showFlow({ origin_id: origin, destination_id: destination, origin: "", destination: "", count: 0 }, quiet);
+  } else if (kind === "record" && record) {
+    openSourceRecord(record, quiet);
+    return;
+  }
+
+  // a record tab sits next to the restored detail
+  if (record) openRecord({ sourceId: record, push: false });
+}
+
+// Apply the hash to the state; returns what the detail panel should reopen.
 async function restoreFromHash() {
   const params = new URLSearchParams(location.hash.slice(1));
   const meta = state.meta;
@@ -2033,7 +2698,11 @@ async function restoreFromHash() {
   state.cursor = null;
 
   const place = params.get("place")?.match(/^(\d+):(.*)$/s);
-  state.place = place ? { id: Number(place[1]), name: place[2] || `#${place[1]}` } : null;
+  const prefix = params.get("pp")?.trim();
+  state.place = place
+    ? { id: Number(place[1]), name: place[2] || `#${place[1]}` }
+    : prefix ? { prefix, name: prefix } : null;
+  state.direction = state.place && ["arrival", "departure"].includes(params.get("dir")) ? params.get("dir") : "";
 
   const ids = [...new Set(
     (params.get("k") ?? "").split(",").map(Number).filter((id) => Number.isInteger(id) && id > 0)
@@ -2043,7 +2712,7 @@ async function restoreFromHash() {
   const loaded = await Promise.all(ids.map(async (id) => {
     if (known.has(id)) return known.get(id);
     try {
-      return { person: await getPerson(id), hue: null };
+      return { person: await getPerson(id), hue: null, matched: null };
     } catch (error) {
       console.error(error);
       return null;
@@ -2054,7 +2723,11 @@ async function restoreFromHash() {
 
   state.persons = [];
   for (const entry of loaded.filter(Boolean)) {
-    state.persons.push({ person: entry.person, hue: entry.hue ?? pickHue(state.persons.map((e) => e.hue)) });
+    state.persons.push({
+      person: entry.person,
+      hue: entry.hue ?? pickHue(state.persons.map((e) => e.hue)),
+      matched: entry.matched ?? null
+    });
   }
 
   const active = Number(params.get("a"));
@@ -2062,17 +2735,32 @@ async function restoreFromHash() {
     ? active
     : state.persons.at(-1)?.person.id ?? null;
 
-  if (state.persons.length) {
-    state.detail = { kind: "person" };
-    state.tab = "route";
-    state.record = null;
-  } else if (state.detail.kind === "person") {
-    state.detail = { kind: "overview" };
-  }
+  state.record = null;
+  state.detailRequest += 1;
+  state.detail = state.persons.length ? { kind: "person" } : { kind: "overview" };
+  state.tab = state.persons.length ? "route" : null;
 
   state.lastCount = null;
   populateFilterOptions();
-  setView(params.get("view") === "sources" ? "sources" : "map");
+
+  queryView.setState({
+    mode: params.get("qm") === "charts" ? "charts" : "table",
+    page: Math.max(0, Number.parseInt(params.get("qp") ?? "0", 10) || 0),
+    sort: params.get("qs") ?? "year",
+    top: Number(params.get("qt")) || 10
+  }, { silent: true });
+
+  const sourcesQuery = params.get("sq") ?? "";
+  if (sourcesQuery !== state.sources.q) {
+    els.sourcesQuery.value = sourcesQuery;
+    state.sources.loaded = false;
+  }
+
+  const view = params.get("view");
+  setView(VIEWS.includes(view) ? view : "map");
+
+  const record = Number(params.get("r"));
+  return { token: params.get("d"), record: Number.isInteger(record) && record > 0 ? record : null };
 }
 
 /* ---------- locale ---------- */
@@ -2082,12 +2770,19 @@ function onLocaleChange() {
 
   setStatus(state.status);
   syncTimeline();
+  renderPlaceFilter();
+  renderYearHint();
   renderMapMode();
   renderPersonChips();
   renderDetail();
   renderLegend();
+  renderAccess();
 
-  if (state.meta) renderMapHeading();
+  if (state.meta) {
+    renderMapHeading();
+    renderCoverage();
+    queryView.render();
+  }
   if (state.sources.loaded || state.sources.loading) renderSources();
 
   if (!els.mapEmpty.hidden) {
@@ -2098,6 +2793,42 @@ function onLocaleChange() {
     } else if (state.lastCount) {
       setMapEmpty(emptyReason());
     }
+  }
+}
+
+/* ---------- admin view / user view ---------- */
+
+// Source texts are for the admin view. The server enforces it when an admin
+// password is configured; an admin can also preview the user view here.
+function canSeeSources() {
+  return state.session.role === "admin" && !state.userView;
+}
+
+function readUserViewPreference() {
+  try {
+    return localStorage.getItem(VIEW_PREF_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function renderAccess() {
+  const { role, login_enabled: loginEnabled } = state.session;
+  const admin = role === "admin";
+
+  els.navSources.hidden = !canSeeSources();
+  if (!canSeeSources() && state.view === "sources") setView("map");
+
+  els.viewToggle.hidden = !admin;
+  els.viewToggle.textContent = state.userView ? t("access.userView") : t("access.adminView");
+  els.viewToggle.title = t("access.toggleHelp");
+  els.viewToggle.setAttribute("aria-pressed", String(state.userView));
+  els.viewToggle.classList.toggle("is-on", state.userView);
+
+  els.accessLink.hidden = !loginEnabled;
+  if (loginEnabled) {
+    els.accessLink.href = admin ? "/admin/logout" : "/admin/login";
+    els.accessLink.textContent = admin ? t("access.logout") : t("access.login");
   }
 }
 
@@ -2144,44 +2875,8 @@ function formatCoordinate(value, positive, negative) {
   return `${Math.abs(value).toFixed(3)}° ${value >= 0 ? positive : negative}`;
 }
 
-// Whether a step of a kadı's route can appear on the map: a journey needs
-// both ends, leaving a post only the place that was left.
-function isDrawable(appointment) {
-  const destination = Number.isFinite(appointment.destination_latitude) &&
-    Number.isFinite(appointment.destination_longitude);
-
-  if (appointment.role === "departed") return destination;
-
-  return destination &&
-    Number.isFinite(appointment.origin_latitude) &&
-    Number.isFinite(appointment.origin_longitude);
-}
-
-function formatNumber(value) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return "—";
-  return new Intl.NumberFormat(numberLocale()).format(number);
-}
-
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
-}
-
-// Tiny DOM builder. Strings become text nodes, never HTML.
-function el(tag, attributes = {}, ...children) {
-  const element = document.createElement(tag);
-
-  for (const [key, value] of Object.entries(attributes)) {
-    if (value === null || value === undefined || value === false) continue;
-    element.setAttribute(key, value === true ? "" : String(value));
-  }
-
-  for (const child of children.flat()) {
-    if (child === null || child === undefined || child === false || child === "") continue;
-    element.append(child instanceof Node ? child : document.createTextNode(String(child)));
-  }
-
-  return element;
 }
 
 /* Toasts: tiny rectangles delivering consequences. */

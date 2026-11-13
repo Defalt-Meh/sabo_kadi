@@ -17,6 +17,10 @@ pub struct PlaceQuery {
     pub q: Option<String>,
     pub has_coordinates: Option<bool>,
     pub has_wikidata: Option<bool>,
+    /// `contains` (default): the name contains the text anywhere;
+    /// `prefix`: the name starts with it (`Misis` → `Misis maa Ayaş`).
+    #[serde(rename = "match")]
+    pub match_mode: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
@@ -40,6 +44,7 @@ pub async fn list(
     Query(q): Query<PlaceQuery>,
 ) -> ApiResult<Json<Page<PlaceListItem>>> {
     let page = resolve_page(q.limit, q.offset, &state)?;
+    let prefix_only = super::prefix_mode(q.match_mode.as_deref())?;
     let name_needle = q
         .query
         .as_deref()
@@ -47,18 +52,33 @@ pub async fn list(
         .and_then(normalize_key);
 
     let mut count_qb: QueryBuilder<Postgres> = QueryBuilder::new("SELECT count(*) FROM places p");
-    apply_filters(&mut count_qb, &q, name_needle.as_deref());
+    apply_filters(&mut count_qb, &q, name_needle.as_deref(), prefix_only);
     let total: i64 = count_qb.build_query_scalar().fetch_one(&state.pool).await?;
 
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
         "SELECT p.id, p.canonical_name, p.normalized_name, p.latitude, p.longitude, \
          p.coordinate_source, p.wikidata_qid, \
-         (SELECT count(*) FROM appointments a WHERE a.destination_place_id = p.id) AS inflow_count, \
-         (SELECT count(*) FROM appointments a WHERE a.origin_place_id = p.id) AS outflow_count \
-         FROM places p",
+         c.inflow_count, c.outflow_count \
+         FROM places p \
+         CROSS JOIN LATERAL ( \
+             SELECT count(*) FILTER (WHERE a.destination_place_id = p.id) AS inflow_count, \
+                    count(*) FILTER (WHERE a.origin_place_id = p.id) AS outflow_count \
+             FROM appointments a WHERE a.destination_place_id = p.id OR a.origin_place_id = p.id \
+         ) c",
     );
-    apply_filters(&mut qb, &q, name_needle.as_deref());
-    qb.push(" ORDER BY p.canonical_name, p.id LIMIT ");
+    apply_filters(&mut qb, &q, name_needle.as_deref(), prefix_only);
+    // a search lists names that start with the text first, then the most
+    // frequent ones, so "Mehmed" is not buried under "Abdi Mehmed…"
+    match name_needle.as_deref() {
+        Some(needle) => {
+            qb.push(" ORDER BY (p.normalized_name LIKE ")
+                .push_bind(format!("{needle}%"))
+                .push(") DESC, (c.inflow_count + c.outflow_count) DESC, p.canonical_name, p.id LIMIT ");
+        }
+        None => {
+            qb.push(" ORDER BY p.canonical_name, p.id LIMIT ");
+        }
+    }
     qb.push_bind(page.limit);
     qb.push(" OFFSET ");
     qb.push_bind(page.offset);
@@ -75,6 +95,7 @@ fn apply_filters<'a>(
     qb: &mut QueryBuilder<'a, Postgres>,
     q: &'a PlaceQuery,
     name_needle: Option<&'a str>,
+    prefix_only: bool,
 ) {
     let mut first = true;
     let mut clause = |qb: &mut QueryBuilder<'a, Postgres>| {
@@ -84,9 +105,15 @@ fn apply_filters<'a>(
 
     if let Some(needle) = name_needle {
         clause(qb);
-        qb.push("p.normalized_name LIKE '%' || ")
-            .push_bind(needle)
-            .push(" || '%'");
+        if prefix_only {
+            qb.push("p.normalized_name LIKE ")
+                .push_bind(needle)
+                .push(" || '%'");
+        } else {
+            qb.push("p.normalized_name LIKE '%' || ")
+                .push_bind(needle)
+                .push(" || '%'");
+        }
     }
     match q.has_coordinates {
         Some(true) => {
@@ -220,11 +247,17 @@ pub async fn detail(
             (SELECT count(*) FROM appointments WHERE destination_place_id = $1) AS inbound_appointments,
             (SELECT count(*) FROM appointments WHERE origin_place_id = $1)      AS outbound_appointments,
             (SELECT count(DISTINCT pid) FROM (
+                -- came here (incoming kadı of a record whose new place is here)
                 SELECT new_person_id AS pid FROM appointments
                     WHERE destination_place_id = $1 AND new_person_id IS NOT NULL
                 UNION
-                SELECT old_person_id AS pid FROM appointments
-                    WHERE origin_place_id = $1 AND old_person_id IS NOT NULL
+                -- left for another post (incoming kadı elsewhere, old place here)
+                SELECT new_person_id FROM appointments
+                    WHERE origin_place_id = $1 AND new_person_id IS NOT NULL
+                UNION
+                -- replaced here (outgoing kadı of a record whose new place is here)
+                SELECT old_person_id FROM appointments
+                    WHERE destination_place_id = $1 AND old_person_id IS NOT NULL
             ) u) AS distinct_persons
         "#,
     )
@@ -236,11 +269,14 @@ pub async fn detail(
         r#"
         SELECT pr.id, pr.canonical_name, pr.resolution_status,
                count(*) FILTER (WHERE a.destination_place_id = $1 AND a.new_person_id = pr.id) AS arrived_here,
-               count(*) FILTER (WHERE a.origin_place_id = $1      AND a.old_person_id = pr.id) AS left_here
+               count(*) FILTER (WHERE (a.origin_place_id = $1 AND a.new_person_id = pr.id)
+                                   OR (a.destination_place_id = $1 AND a.old_person_id = pr.id)) AS left_here
         FROM persons pr
+        -- a record moves the incoming kadı from the old place to the new one,
+        -- where they replace the outgoing kadı (architecture.md, "API notes")
         JOIN appointments a
-          ON (a.destination_place_id = $1 AND a.new_person_id = pr.id)
-          OR (a.origin_place_id = $1      AND a.old_person_id = pr.id)
+          ON (a.destination_place_id = $1 AND (a.new_person_id = pr.id OR a.old_person_id = pr.id))
+          OR (a.origin_place_id = $1      AND a.new_person_id = pr.id)
         GROUP BY pr.id, pr.canonical_name, pr.resolution_status
         ORDER BY (count(*)) DESC, pr.canonical_name
         LIMIT 50

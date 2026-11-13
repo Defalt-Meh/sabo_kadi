@@ -892,3 +892,250 @@ async fn delivered_workbook_with_untrusted_gazetteer() {
         r.gazetteer
     );
 }
+
+#[tokio::test]
+async fn query_page_charts_and_export() {
+    let (app, pool) = common::setup_app().await;
+
+    let rows = vec![
+        row(
+            "qry-1",
+            Cell::S("Qkadi Old One"),
+            Cell::S("Qkadi New One"),
+            Cell::S("Qadana"),
+            Cell::S("Qmisis"),
+            Cell::S("1150"),
+            Cell::Empty,
+            Some((37.0, 35.3, 36.95, 35.6)),
+        ),
+        row(
+            "qry-2",
+            Cell::S("Qkadi Old Two"),
+            Cell::S("Qkadi New Two"),
+            Cell::S("Qmisis"),
+            Cell::S("Qadana"),
+            Cell::S("1151"),
+            Cell::Empty,
+            Some((36.95, 35.6, 37.0, 35.3)),
+        ),
+        // a longer name that starts with "Qmisis", never geocoded
+        row(
+            "qry-3",
+            Cell::S("Qkadi Old Three"),
+            Cell::S("Qkadi New One"),
+            Cell::S("Qadana"),
+            Cell::S("Qmisis maa Ayas"),
+            Cell::S("1160"),
+            Cell::Empty,
+            None,
+        ),
+        row(
+            "qry-4",
+            Cell::S("Qkadi Old Four"),
+            Cell::S("Qkadi New Four"),
+            Cell::S("Qadana"),
+            Cell::S("Qtarsus"),
+            Cell::S("-"),
+            Cell::Empty,
+            None,
+        ),
+    ];
+    let (_d, path) = write_fixture(STD_HEADERS, &rows);
+    import_path(&pool, &path, &ImportOptions::default())
+        .await
+        .unwrap();
+
+    // prefix group + direction
+    let (s, body) = get(
+        &app,
+        "/api/v1/appointments?place_prefix=Qmisis&direction=arrival",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        body["total"], 2,
+        "qry-1 and qry-3 arrive at a Qmisis* place"
+    );
+    let (_s, body) = get(
+        &app,
+        "/api/v1/appointments?place_prefix=qmisis&direction=departure",
+    )
+    .await;
+    assert_eq!(body["total"], 1);
+    let (_s, body) = get(
+        &app,
+        "/api/v1/appointments?place_prefix=QMISIS&sort=destination",
+    )
+    .await;
+    assert_eq!(body["total"], 3);
+    assert_eq!(body["items"][0]["raw_new_place"], "Qadana");
+
+    for bad in [
+        "/api/v1/appointments?direction=sideways",
+        "/api/v1/appointments?sort=nope",
+        "/api/v1/appointments?persons=1,x",
+        "/api/v1/stats?by=colour",
+        "/api/v1/places?q=a&match=fuzzy",
+    ] {
+        let (s, _) = get(&app, bad).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}");
+    }
+
+    // ids for highlighting a route
+    let (_s, body) = get(
+        &app,
+        "/api/v1/appointments/ids?place_prefix=qmisis&direction=arrival",
+    )
+    .await;
+    assert_eq!(body["total"], 2);
+    assert_eq!(body["ids"].as_array().unwrap().len(), 2);
+
+    // charts
+    let (s, body) = get(&app, "/api/v1/stats?by=destination&place_prefix=qmisis").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["records"], 3);
+    let labels: Vec<&str> = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["label"].as_str().unwrap())
+        .collect();
+    assert!(labels.contains(&"Qmisis") && labels.contains(&"Qmisis maa Ayas"));
+
+    let (_s, body) = get(&app, "/api/v1/stats?by=decade&place_prefix=qmisis").await;
+    let decades: Vec<(i64, i64)> = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| (i["value"].as_i64().unwrap(), i["count"].as_i64().unwrap()))
+        .collect();
+    assert_eq!(decades, [(1150, 2), (1160, 1)]);
+
+    let (_s, body) = get(&app, "/api/v1/stats?by=new_kadi&place=0").await;
+    assert_eq!(body["records"], 0);
+
+    let new_one: i64 =
+        sqlx::query_scalar("SELECT id FROM persons WHERE normalized_name = 'qkadi new one'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let (_s, body) = get(&app, &format!("/api/v1/stats?by=person&persons={new_one}")).await;
+    assert_eq!(body["records"], 2);
+
+    // summary: how much of a selection can be drawn
+    let (_s, body) = get(&app, "/api/v1/stats/summary?place_prefix=qmisis").await;
+    assert_eq!(body["records"], 3);
+    assert_eq!(body["mapped"], 2);
+    let (_s, body) = get(&app, "/api/v1/stats/summary?place_prefix=qadana").await;
+    assert_eq!(body["records"], 4);
+    assert_eq!(body["undated"], 1);
+
+    // prefix search for the place picker
+    let (_s, body) = get(&app, "/api/v1/places?q=qmisis&match=prefix").await;
+    assert_eq!(body["total"], 2);
+    let (_s, body) = get(&app, "/api/v1/places?q=ayas&match=prefix").await;
+    assert_eq!(body["total"], 0);
+    let (_s, body) = get(&app, "/api/v1/places?q=ayas").await;
+    assert!(body["total"].as_i64().unwrap() >= 1);
+
+    // CSV export
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/export/appointments.csv?place_prefix=qmisis")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/csv"));
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let csv = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(csv.starts_with("\u{feff}appointment_id,doc_id"));
+    assert_eq!(csv.lines().count(), 4, "header + 3 records");
+    assert!(csv.contains("Qmisis maa Ayas"));
+    // 1150 H began in 1737
+    assert!(csv.contains(",1150,1737"), "{csv}");
+
+    // open deployment: everybody is admin, no login
+    let (_s, body) = get(&app, "/api/v1/session").await;
+    assert_eq!(body["role"], "admin");
+    assert_eq!(body["login_enabled"], false);
+}
+
+#[tokio::test]
+async fn user_view_hides_source_texts_until_admin_login() {
+    use base64::Engine;
+    use kadi_atlas::app::{build_router, AppState};
+
+    let pool = common::setup_pool().await;
+    let mut cfg = common::test_config();
+    cfg.admin_password = Some("test-parola-123".into());
+    let app = build_router(AppState::new(pool, &cfg), &cfg);
+
+    let send = |uri: &str, header: Option<(&'static str, String)>| {
+        let mut request = Request::builder().uri(uri);
+        if let Some((name, value)) = header {
+            request = request.header(name, value);
+        }
+        app.clone().oneshot(request.body(Body::empty()).unwrap())
+    };
+
+    let (_s, body) = get(&app, "/api/v1/session").await;
+    assert_eq!(body["role"], "user");
+    assert_eq!(body["login_enabled"], true);
+
+    let (s, body) = get(&app, "/api/v1/sources").await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "forbidden");
+    let (s, _) = get(&app, "/api/v1/sources/1").await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    // the rest of the API is public
+    let (s, _) = get(&app, "/api/v1/appointments?limit=1").await;
+    assert_eq!(s, StatusCode::OK);
+
+    let resp = send("/admin/login", None).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(resp.headers().contains_key("www-authenticate"));
+
+    let basic = |pw: &str| {
+        let token = base64::engine::general_purpose::STANDARD.encode(format!("admin:{pw}"));
+        Some(("authorization", format!("Basic {token}")))
+    };
+    let resp = send("/admin/login", basic("wrong-password")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = send("/admin/login", basic("test-parola-123"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let cookie = resp.headers()["set-cookie"].to_str().unwrap().to_string();
+    assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict"));
+    let pair = cookie.split(';').next().unwrap().to_string();
+
+    let resp = send("/api/v1/sources?limit=1", Some(("cookie", pair.clone())))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = send("/api/v1/session", Some(("cookie", pair)))
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["role"], "admin");
+
+    let resp = send("/admin/logout", None).await.unwrap();
+    assert!(resp.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .contains("Max-Age=0"));
+}

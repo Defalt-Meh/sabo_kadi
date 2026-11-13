@@ -14,7 +14,7 @@ use anyhow::{anyhow, Context, Result};
 /// Prefix for service-specific variables, e.g. `KADI_ATLAS__BIND_ADDR`.
 const PREFIX: &str = "KADI_ATLAS__";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     /// PostgreSQL/PostGIS connection string.
     pub database_url: String,
@@ -41,6 +41,33 @@ pub struct Config {
     /// Optional directory with the static frontend (`web/`). When set, it is
     /// served at `/` on the same origin as the API, so no CORS is needed.
     pub web_dir: Option<PathBuf>,
+    /// Optional admin password. When set, source texts are only served to
+    /// visitors who logged in at `/admin/login` (see `auth.rs`); everybody
+    /// else gets the user view.
+    pub admin_password: Option<String>,
+}
+
+// Hand-written so the admin password never reaches a log line.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("database_url", &"<redacted>")
+            .field("database_max_connections", &self.database_max_connections)
+            .field("database_acquire_timeout", &self.database_acquire_timeout)
+            .field("bind_addr", &self.bind_addr)
+            .field("default_page_size", &self.default_page_size)
+            .field("max_page_size", &self.max_page_size)
+            .field("request_timeout", &self.request_timeout)
+            .field("auto_migrate", &self.auto_migrate)
+            .field("log_format", &self.log_format)
+            .field("cors_allow_origin", &self.cors_allow_origin)
+            .field("web_dir", &self.web_dir)
+            .field(
+                "admin_password",
+                &self.admin_password.as_ref().map(|_| "<set>"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +146,16 @@ impl Config {
             }
         }
 
+        let admin_password = var(&lookup, "ADMIN_PASSWORD");
+        if admin_password
+            .as_ref()
+            .is_some_and(|p| p.chars().count() < 8)
+        {
+            return Err(anyhow!(
+                "KADI_ATLAS__ADMIN_PASSWORD must be at least 8 characters long"
+            ));
+        }
+
         Ok(Self {
             database_url,
             database_max_connections,
@@ -131,6 +168,7 @@ impl Config {
             log_format,
             cors_allow_origin,
             web_dir,
+            admin_password,
         })
     }
 }
@@ -198,6 +236,17 @@ mod tests {
         assert_eq!(cfg.log_format, LogFormat::Pretty);
         assert_eq!(cfg.cors_allow_origin, None);
         assert_eq!(cfg.web_dir, None);
+        assert_eq!(cfg.admin_password, None);
+    }
+
+    #[test]
+    fn admin_password_is_validated_and_never_printed() {
+        assert!(err(&[DB, ("KADI_ATLAS__ADMIN_PASSWORD", "short")]).contains("at least 8"));
+        let cfg = load(&[DB, ("KADI_ATLAS__ADMIN_PASSWORD", "uzun-bir-parola")]).unwrap();
+        assert_eq!(cfg.admin_password.as_deref(), Some("uzun-bir-parola"));
+        let printed = format!("{cfg:?}");
+        assert!(!printed.contains("uzun-bir-parola"));
+        assert!(!printed.contains("postgres://"));
     }
 
     #[test]

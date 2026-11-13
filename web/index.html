@@ -41,7 +41,8 @@
 
     <nav class="topnav" aria-label="Ana menü" data-i18n-aria-label="nav.main">
       <button class="nav-item is-active" type="button" data-view="map" aria-current="page" data-i18n="nav.map">Harita</button>
-      <button class="nav-item" type="button" data-view="sources" data-i18n="nav.sources">Kaynaklar</button>
+      <button class="nav-item" type="button" data-view="query" data-i18n="nav.query">Sorgu</button>
+      <button id="nav-sources" class="nav-item" type="button" data-view="sources" data-i18n="nav.sources">Kaynaklar</button>
       <button class="nav-item" type="button" data-action="about" data-i18n="nav.about">Yöntem</button>
     </nav>
 
@@ -50,6 +51,9 @@
         <span class="status-dot" aria-hidden="true"></span>
         <span id="dataset-status-label" data-i18n="status.loading">Veri yükleniyor</span>
       </div>
+
+      <button id="view-toggle" class="access-button" type="button" hidden></button>
+      <a id="access-link" class="access-button" hidden></a>
 
       <button id="language-toggle" class="icon-button" type="button" aria-label="Switch to English" title="English">
         <span id="language-toggle-label" class="icon-button-text" aria-hidden="true">EN</span>
@@ -159,6 +163,17 @@
             </div>
           </div>
 
+          <p id="year-gregorian" class="field-note" hidden></p>
+
+          <div class="field-group">
+            <span class="field-label" id="date-mode-label" data-i18n="time.display">Tarih gösterimi</span>
+            <div id="date-mode" class="segmented-control is-small" role="group" aria-labelledby="date-mode-label">
+              <button class="segment" type="button" data-date-mode="hijri" data-i18n="time.hijri">Hicrî</button>
+              <button class="segment" type="button" data-date-mode="gregorian" data-i18n="time.gregorian">Miladi</button>
+              <button class="segment" type="button" data-date-mode="both" data-i18n="time.both">İkisi</button>
+            </div>
+          </div>
+
           <p class="field-note" data-i18n="time.note">
             Yıllar kaynak metinden çıkarılmış yaklaşık değerlerdir; takvim belirtilmemiştir.
           </p>
@@ -215,7 +230,17 @@
               <span id="place-filter-name"></span>
               <button id="place-filter-clear" type="button" class="chip-remove" aria-label="Yer filtresini kaldır" data-i18n-aria-label="filters.removePlace">×</button>
             </div>
+            <p class="field-note" data-i18n="filters.placeHint">Yazdığınız adla başlayan tüm yerleri birlikte seçmek için listedeki ilk seçeneği kullanın.</p>
           </div>
+
+          <label class="field-group" for="direction-filter">
+            <span data-i18n="filters.direction">Hareket yönü (seçili yere göre)</span>
+            <select id="direction-filter" class="input select-input" disabled>
+              <option value="" data-i18n="filters.directionAny">Gelen ve giden</option>
+              <option value="arrival" data-i18n="filters.directionArrival">Bu yere gelen (atanan) kadılar</option>
+              <option value="departure" data-i18n="filters.directionDeparture">Bu yerden ayrılıp başka yere atananlar</option>
+            </select>
+          </label>
 
           <button id="reset-filters" class="secondary-button" type="button" data-i18n="actions.resetFilters">Filtreleri sıfırla</button>
         </section>
@@ -243,6 +268,7 @@
               <span id="result-count" class="result-count"></span>
             </div>
             <p id="map-subtitle" data-i18n="map.subtitle">Koordinatı bulunan kayıtlar zaman ve mekân içinde gösterilir.</p>
+            <p id="map-coverage" class="map-coverage" hidden></p>
           </div>
 
           <div class="view-controls">
@@ -301,6 +327,62 @@
         </div>
       </div>
 
+      <!-- Query view: the filtered records as a table, and charts of them -->
+      <div id="query-view" class="view query-view" hidden>
+        <div class="view-toolbar">
+          <div class="view-heading">
+            <span class="eyebrow" data-i18n="query.eyebrow">Sorgu</span>
+            <div class="view-title-row">
+              <h1 data-i18n="query.title">Atama kayıtları</h1>
+              <span id="query-count" class="result-count"></span>
+            </div>
+            <p id="query-filters" class="query-filters"></p>
+          </div>
+
+          <div class="view-controls">
+            <div class="segmented-control" role="group" aria-label="Sorgu görünümü" data-i18n-aria-label="query.mode">
+              <button class="segment is-active" type="button" data-query-mode="table" aria-pressed="true" data-i18n="query.table">Tablo</button>
+              <button class="segment" type="button" data-query-mode="charts" aria-pressed="false" data-i18n="query.charts">Grafikler</button>
+            </div>
+            <a id="query-csv" class="secondary-button compact" href="#" download data-i18n="query.csv">CSV indir</a>
+          </div>
+        </div>
+
+        <div class="query-body">
+          <section id="query-table-panel" class="query-panel" aria-labelledby="query-table-caption">
+            <div class="table-wrap">
+              <table class="data-table">
+                <caption id="query-table-caption" class="sr-only" data-i18n="query.caption">Süzgeçlere uyan atama kayıtları</caption>
+                <thead id="query-head"></thead>
+                <tbody id="query-rows"></tbody>
+              </table>
+            </div>
+            <div class="pager">
+              <button id="query-prev" class="secondary-button compact" type="button" data-i18n="query.prev">‹ Önceki</button>
+              <span id="query-range" class="pager-range"></span>
+              <button id="query-next" class="secondary-button compact" type="button" data-i18n="query.next">Sonraki ›</button>
+            </div>
+          </section>
+
+          <section id="query-charts-panel" class="query-panel" hidden>
+            <div class="charts-toolbar">
+              <label class="inline-field" for="chart-top">
+                <span data-i18n="charts.top">Sıralamalarda gösterilen</span>
+                <select id="chart-top" class="input select-input">
+                  <option value="10">10</option>
+                  <option value="20">20</option>
+                  <option value="50">50</option>
+                </select>
+              </label>
+              <p class="field-note" data-i18n="charts.note">Grafikler soldaki süzgeçlere uyan kayıtlardan hesaplanır. Bir çubuğa tıklayarak o yeri, kadıyı veya dönemi açabilirsiniz.</p>
+            </div>
+            <div id="charts-grid" class="charts-grid"></div>
+          </section>
+
+          <p id="query-status" class="query-status" role="status" hidden></p>
+        </div>
+      </div>
+
       <!-- Sources view -->
       <div id="sources-view" class="view sources-view" hidden>
         <div class="view-toolbar">
@@ -337,6 +419,9 @@
     <!-- The drawer has tenure now. -->
     <aside id="details-panel" class="details" aria-label="Seçili kayıt detayları" data-i18n-aria-label="details.aria">
       <div class="details-header">
+        <button id="detail-back" class="icon-button details-back" type="button" hidden aria-label="Önceki ekrana dön" title="Geri" data-i18n-aria-label="details.back" data-i18n-title="details.backShort">
+          <svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16"><path d="M15 6l-6 6 6 6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
         <div class="details-heading">
           <span id="detail-eyebrow" class="eyebrow" data-i18n="details.eyebrow">Seçim</span>
           <h2 id="detail-title" data-i18n="details.overview">Genel görünüm</h2>
@@ -379,6 +464,10 @@
         <dd data-i18n="about.colors">Her kadı kendi rengiyle çizilir: ilk atama yerinde açık, güzergâh boyunca koyulaşır. Akış görünümünde çizgi kalınlığı kayıt sayısını gösterir; oklar yönü belirtir.</dd>
         <dt data-i18n="about.mapTitle">Harita</dt>
         <dd data-i18n="about.map">Yalnızca koordinatı girilmiş yerler haritada görünür. Kıyı çizgileri günümüz coğrafyasıdır (Natural Earth).</dd>
+        <dt data-i18n="about.datesTitle">Hicrî / Miladi</dt>
+        <dd data-i18n="about.dates">Miladi karşılıklar, yılın hicrî olduğu varsayımıyla tablo usulü hicrî takvimden hesaplanır (≈ işaretli). Bir hicrî yıl çoğunlukla iki miladi yıla yayılır (ör. 1162 → 1748/49).</dd>
+        <dt data-i18n="about.navTitle">Geri dönmek</dt>
+        <dd data-i18n="about.nav">Süzgeçler, seçili kadılar ve açık ayrıntı adres çubuğunda saklanır. Tarayıcının Geri düğmesi veya ayrıntı panelindeki ‹ düğmesi önceki ekranı tüm süzgeçleriyle geri getirir; adresi paylaşarak aynı görünümü başkasına gönderebilirsiniz.</dd>
       </dl>
     </div>
   </dialog>

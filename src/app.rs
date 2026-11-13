@@ -18,6 +18,7 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::api;
+use crate::auth::{self, Auth};
 use crate::config::Config;
 
 /// Initialize the global tracing subscriber from configuration.
@@ -51,6 +52,8 @@ pub struct AppState {
     pub pool: PgPool,
     pub default_page_size: i64,
     pub max_page_size: i64,
+    /// Admin login (user view vs admin view), see `auth.rs`.
+    pub auth: Auth,
 }
 
 impl AppState {
@@ -59,6 +62,7 @@ impl AppState {
             pool,
             default_page_size: cfg.default_page_size,
             max_page_size: cfg.max_page_size,
+            auth: Auth::new(cfg.admin_password.as_deref()),
         }
     }
 }
@@ -116,6 +120,8 @@ pub fn build_router(state: AppState, cfg: &Config) -> Router {
         // unknown API paths stay JSON 404s even when the frontend is served
         .route("/api", axum::routing::any(not_found))
         .route("/api/{*rest}", axum::routing::any(not_found))
+        .route("/admin/login", axum::routing::get(auth::login))
+        .route("/admin/logout", axum::routing::get(auth::logout))
         .method_not_allowed_fallback(method_not_allowed);
 
     let router = match &cfg.web_dir {

@@ -20,6 +20,10 @@ pub struct PersonQuery {
     pub q: Option<String>,
     pub resolution_status: Option<String>,
     pub has_wikidata: Option<bool>,
+    /// `contains` (default): the name contains the text anywhere;
+    /// `prefix`: the name starts with it (`Misis` → `Misis maa Ayaş`).
+    #[serde(rename = "match")]
+    pub match_mode: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
@@ -54,10 +58,11 @@ pub async fn list(
             )));
         }
     }
+    let prefix_only = super::prefix_mode(q.match_mode.as_deref())?;
     let name_needle = q.search_term().and_then(normalize_key);
 
     let mut count_qb: QueryBuilder<Postgres> = QueryBuilder::new("SELECT count(*) FROM persons p");
-    apply_filters(&mut count_qb, &q, name_needle.as_deref());
+    apply_filters(&mut count_qb, &q, name_needle.as_deref(), prefix_only);
     let total: i64 = count_qb.build_query_scalar().fetch_one(&state.pool).await?;
 
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
@@ -66,8 +71,19 @@ pub async fn list(
           WHERE a.old_person_id = p.id OR a.new_person_id = p.id) AS appointment_count \
          FROM persons p",
     );
-    apply_filters(&mut qb, &q, name_needle.as_deref());
-    qb.push(" ORDER BY p.canonical_name, p.id LIMIT ");
+    apply_filters(&mut qb, &q, name_needle.as_deref(), prefix_only);
+    // a search lists names that start with the text first, then the most
+    // frequent ones, so "Mehmed" is not buried under "Abdi Mehmed…"
+    match name_needle.as_deref() {
+        Some(needle) => {
+            qb.push(" ORDER BY (p.normalized_name LIKE ")
+                .push_bind(format!("{needle}%"))
+                .push(") DESC, appointment_count DESC, p.canonical_name, p.id LIMIT ");
+        }
+        None => {
+            qb.push(" ORDER BY p.canonical_name, p.id LIMIT ");
+        }
+    }
     qb.push_bind(page.limit);
     qb.push(" OFFSET ");
     qb.push_bind(page.offset);
@@ -84,6 +100,7 @@ fn apply_filters<'a>(
     qb: &mut QueryBuilder<'a, Postgres>,
     q: &'a PersonQuery,
     name_needle: Option<&'a str>,
+    prefix_only: bool,
 ) {
     let mut first = true;
     let mut clause = |qb: &mut QueryBuilder<'a, Postgres>| {
@@ -93,9 +110,15 @@ fn apply_filters<'a>(
 
     if let Some(needle) = name_needle {
         clause(qb);
-        qb.push("p.normalized_name LIKE '%' || ")
-            .push_bind(needle)
-            .push(" || '%'");
+        if prefix_only {
+            qb.push("p.normalized_name LIKE ")
+                .push_bind(needle)
+                .push(" || '%'");
+        } else {
+            qb.push("p.normalized_name LIKE '%' || ")
+                .push_bind(needle)
+                .push(" || '%'");
+        }
     }
     if let Some(status) = &q.resolution_status {
         clause(qb);

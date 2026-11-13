@@ -6,27 +6,18 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use sqlx::{Postgres, QueryBuilder};
 
-use super::{validate_year_range, Page, PageParams, Query};
+use super::filters::{Clauses, FilterParams};
+use super::{Page, PageParams, Query};
 use crate::app::AppState;
 use crate::error::{ApiError, ApiResult};
-use crate::normalize::fold_term;
 
 /// Places are small rows and a map wants all of them at once, so this endpoint
 /// has its own, larger cap instead of the global page size.
 const MAX_LIMIT: i64 = 5000;
 
+/// Endpoint-specific parameters; the filters are [`FilterParams`].
 #[derive(Debug, Deserialize)]
 pub struct ActivityQuery {
-    pub year_from: Option<i32>,
-    pub year_to: Option<i32>,
-    pub person: Option<i64>,
-    /// Alias for `person`.
-    pub person_id: Option<i64>,
-    pub place: Option<i64>,
-    /// Alias for `place`.
-    pub place_id: Option<i64>,
-    pub degree: Option<String>,
-    pub position_type: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
@@ -47,9 +38,10 @@ pub struct PlaceActivity {
 
 pub async fn places(
     State(state): State<AppState>,
+    Query(filter): Query<FilterParams>,
     Query(q): Query<ActivityQuery>,
 ) -> ApiResult<Json<Page<PlaceActivity>>> {
-    validate_year_range(q.year_from, q.year_to)?;
+    let filters = filter.resolve()?;
 
     let limit = match q.limit {
         None => MAX_LIMIT,
@@ -73,7 +65,7 @@ pub async fn places(
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
         "WITH a AS (SELECT a.origin_place_id, a.destination_place_id FROM appointments a",
     );
-    apply_filters(&mut qb, &q);
+    filters.apply(&mut qb, &mut Clauses::new());
     qb.push(
         "), visits AS ( \
              SELECT destination_place_id AS place_id, 1 AS arrived, 0 AS departed FROM a \
@@ -100,47 +92,4 @@ pub async fn places(
     let total = items.first().map_or(0, |p| p.total_count);
 
     Ok(Json(Page::new(items, total, PageParams { limit, offset })))
-}
-
-fn apply_filters<'a>(qb: &mut QueryBuilder<'a, Postgres>, q: &'a ActivityQuery) {
-    let mut first = true;
-    let mut clause = |qb: &mut QueryBuilder<'a, Postgres>| {
-        qb.push(if first { " WHERE " } else { " AND " });
-        first = false;
-    };
-
-    if let Some(year_from) = q.year_from {
-        clause(qb);
-        qb.push("a.year_numeric >= ").push_bind(year_from);
-    }
-    if let Some(year_to) = q.year_to {
-        clause(qb);
-        qb.push("a.year_numeric <= ").push_bind(year_to);
-    }
-    if let Some(person) = q.person.or(q.person_id) {
-        clause(qb);
-        qb.push("(a.old_person_id = ")
-            .push_bind(person)
-            .push(" OR a.new_person_id = ")
-            .push_bind(person)
-            .push(")");
-    }
-    if let Some(place) = q.place.or(q.place_id) {
-        clause(qb);
-        qb.push("(a.origin_place_id = ")
-            .push_bind(place)
-            .push(" OR a.destination_place_id = ")
-            .push_bind(place)
-            .push(")");
-    }
-    if let Some(degree) = &q.degree {
-        clause(qb);
-        qb.push("a.degree = ")
-            .push_bind(fold_term(degree).unwrap_or_default());
-    }
-    if let Some(position) = &q.position_type {
-        clause(qb);
-        qb.push("a.position_type = ")
-            .push_bind(fold_term(position).unwrap_or_default());
-    }
 }

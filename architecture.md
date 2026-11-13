@@ -37,8 +37,10 @@ Historical data is uncertain. Every transformation the importer does is
 ### `source_records`
 One row per spreadsheet row. `doc_id` is the unique source identity the importer
 is idempotent on. `raw JSONB` holds the original row. `source_text` is indexed
-for full-text search (migration `002`, `to_tsvector('simple', …)` + GIN, plus a
-`pg_trgm` GIN index for "contains" search).
+for full-text search (migration `002`, `to_tsvector('simple', …)` + GIN). The
+`pg_trgm` index on `source_text` from `002` was never used by a query and was
+dropped in `004` (it was a sixth of the database); name searches use trigram
+indexes on `persons.normalized_name` / `places.normalized_name` instead.
 
 ### `persons`
 `canonical_name` (first-seen spelling), `normalized_name` (folded key),
@@ -168,6 +170,36 @@ This is the main thing historians should review (below).
   left it) and the frontend does not draw that record as their journey. Each
   step also carries `old_person` / `new_person` (predecessor / successor) and
   `source_record_id`. This interpretation is open question 5.
+- **Shared filters** (`src/api/filters.rs`): every endpoint that reads
+  appointments resolves the same `FilterParams` (years, persons, place or
+  place-name prefix, direction, degree, type, region, coordinates) into the
+  same SQL, so the map, the query table, the charts and the CSV export can
+  never disagree about which records a filter set selects. `direction` reads a
+  record as the incoming kadı moving old place → new place: `arrival` = the
+  place is the new place, `departure` = the place is the old place.
+- **Stats** (`/stats`, `/stats/summary`) group the filtered records with a
+  `WITH a AS (…)` CTE; `summary.mapped` counts records whose two places both
+  have validated coordinates — the only records the map can draw (598 of
+  23,663 in the first delivery), which the frontend states next to the map.
+- **Itinerary numbering** (`web/js/itinerary.js`): the side panel and the map
+  number a kadı's *stops* with one function, so stop 21 is the same place in
+  both. A place visited several times carries all its numbers (`3·21`). Stops
+  without coordinates keep their number but are skipped on the map; the map
+  joins consecutive drawable stops, solid when one record links them, dashed
+  for a gap in the record or skipped stops in between.
+- **Dates** (`src/calendar.rs`, `web/js/calendar.js`): Gregorian equivalents
+  use the tabular Hijri calendar and assume the year is Hijri; a Hijri year
+  usually spans two Gregorian years (`1162` → `1748/49`). The display mode
+  (Hijri / Gregorian / both) is a viewer preference; filtering stays on
+  `year_numeric`.
+- **User view / admin view** (`src/auth.rs`): with `KADI_ATLAS__ADMIN_PASSWORD`
+  set, `/sources` (source texts and raw rows) answer 403 unless the request
+  carries the admin cookie set by `/admin/login`. This is the one place the
+  read-only API distinguishes callers.
+- **Shareable state**: the frontend keeps filters, selected kadıs, view, open
+  detail and query-page state in the URL hash and pushes a history entry per
+  user action, so Back/Forward restore earlier screens and a copied link
+  reproduces one.
 - `/sources?query=` uses `websearch_to_tsquery('simple', …)` + `ts_rank` +
   `ts_headline`. `'simple'` (no stemming) is chosen for a mixed
   Ottoman-Turkish / transliteration corpus; revisit if a better dictionary is
@@ -211,3 +243,10 @@ This is the main thing historians should review (below).
     separate kind of origin?
 13. **Self-moves.** Rows with `old_place = new_place` (reappointment at the same
     seat) currently appear as `Kilis → Kilis` flows.
+14. **Inflected names.** Place and person cells often carry Turkish case
+    suffixes (`Larende’den`, `Akhisar Saruhan’da`, `Ahmed’in`), creating extra
+    provisional places/persons (81 place names and 332 person names carry an
+    apostrophe + case suffix; separately, 958 of the 4,678 place names are
+    `İstanbul’da X Medresesinden` origins, see question 12). Should the importer strip them, or should they be
+    corrected at the source? The prefix filter (`Larende` → `Larende’den`)
+    works around it for searching only.

@@ -5,40 +5,20 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use sqlx::{Postgres, QueryBuilder};
 
-use super::{resolve_page, validate_year_range, Page, PlaceRef, Query};
+use super::filters::{Clauses, FilterParams, Filters};
+use super::{resolve_page, Page, PlaceRef, Query};
 use crate::app::AppState;
 use crate::error::{ApiError, ApiResult};
-use crate::normalize::fold_term;
 
+/// Endpoint-specific parameters; the filters are [`FilterParams`].
 #[derive(Debug, Deserialize)]
 pub struct FlowQuery {
-    pub year_from: Option<i32>,
-    pub year_to: Option<i32>,
-    /// Restrict to movements involving this person (as outgoing or incoming kadı).
-    pub person: Option<i64>,
-    /// Alias for `person`.
-    pub person_id: Option<i64>,
-    /// Restrict to movements touching this place (as origin or destination).
-    pub place: Option<i64>,
-    /// Alias for `place`.
-    pub place_id: Option<i64>,
-    pub degree: Option<String>,
-    pub position_type: Option<String>,
     /// Minimum aggregated count for a flow to be returned (default 1).
     pub min_count: Option<i64>,
     /// Only include flows where both endpoints have coordinates (default true).
     pub require_coordinates: Option<bool>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
-}
-
-impl FlowQuery {
-    fn person_filter(&self) -> Option<i64> {
-        self.person.or(self.person_id)
-    }
-    fn place_filter(&self) -> Option<i64> {
-        self.place.or(self.place_id)
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -73,9 +53,10 @@ const FROM: &str = r#"
 
 pub async fn list(
     State(state): State<AppState>,
+    Query(filter): Query<FilterParams>,
     Query(q): Query<FlowQuery>,
 ) -> ApiResult<Json<Page<Flow>>> {
-    validate_year_range(q.year_from, q.year_to)?;
+    let filters = filter.resolve()?;
     let page = resolve_page(q.limit, q.offset, &state)?;
 
     let min_count = match q.min_count {
@@ -92,7 +73,7 @@ pub async fn list(
     // total distinct flows
     let mut count_qb: QueryBuilder<Postgres> =
         QueryBuilder::new(format!("SELECT count(*) FROM (SELECT 1 {FROM}"));
-    apply_filters(&mut count_qb, &q, require_coords);
+    apply_filters(&mut count_qb, &filters, require_coords);
     count_qb.push(group_by).push_bind(min_count);
     count_qb.push(") t");
     let total: i64 = count_qb.build_query_scalar().fetch_one(&state.pool).await?;
@@ -104,7 +85,7 @@ pub async fn list(
          d.latitude AS dest_lat, d.longitude AS dest_lon, \
          count(*) AS count, max(a.year_numeric) AS last_year {FROM}"
     ));
-    apply_filters(&mut qb, &q, require_coords);
+    apply_filters(&mut qb, &filters, require_coords);
     qb.push(group_by).push_bind(min_count);
     qb.push(" ORDER BY count(*) DESC, o.canonical_name, d.canonical_name LIMIT ");
     qb.push_bind(page.limit);
@@ -135,49 +116,11 @@ pub async fn list(
     Ok(Json(Page::new(items, total, page)))
 }
 
-fn apply_filters<'a>(qb: &mut QueryBuilder<'a, Postgres>, q: &'a FlowQuery, require_coords: bool) {
-    let mut first = true;
-    let mut clause = |qb: &mut QueryBuilder<'a, Postgres>| {
-        qb.push(if first { " WHERE " } else { " AND " });
-        first = false;
-    };
-
-    if let Some(year_from) = q.year_from {
-        clause(qb);
-        qb.push("a.year_numeric >= ").push_bind(year_from);
-    }
-    if let Some(year_to) = q.year_to {
-        clause(qb);
-        qb.push("a.year_numeric <= ").push_bind(year_to);
-    }
-    if let Some(person) = q.person_filter() {
-        clause(qb);
-        qb.push("(a.old_person_id = ")
-            .push_bind(person)
-            .push(" OR a.new_person_id = ")
-            .push_bind(person)
-            .push(")");
-    }
-    if let Some(place) = q.place_filter() {
-        clause(qb);
-        qb.push("(a.origin_place_id = ")
-            .push_bind(place)
-            .push(" OR a.destination_place_id = ")
-            .push_bind(place)
-            .push(")");
-    }
-    if let Some(degree) = &q.degree {
-        clause(qb);
-        qb.push("a.degree = ")
-            .push_bind(fold_term(degree).unwrap_or_default());
-    }
-    if let Some(position) = &q.position_type {
-        clause(qb);
-        qb.push("a.position_type = ")
-            .push_bind(fold_term(position).unwrap_or_default());
-    }
+fn apply_filters(qb: &mut QueryBuilder<'_, Postgres>, filters: &Filters, require_coords: bool) {
+    let mut clauses = Clauses::new();
+    filters.apply(qb, &mut clauses);
     if require_coords {
-        clause(qb);
+        clauses.next(qb);
         qb.push("o.geom IS NOT NULL AND d.geom IS NOT NULL");
     }
 }

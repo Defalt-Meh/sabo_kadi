@@ -7,7 +7,18 @@ use sqlx::{Postgres, QueryBuilder};
 
 use super::{resolve_page, Page, Query};
 use crate::app::AppState;
+use crate::auth::Role;
 use crate::error::{ApiError, ApiResult};
+
+/// Source texts and raw rows belong to the admin view only.
+fn require_admin(role: Role) -> ApiResult<()> {
+    match role {
+        Role::Admin => Ok(()),
+        Role::User => Err(ApiError::forbidden(
+            "source texts are available in the admin view only",
+        )),
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct SourceQuery {
@@ -45,8 +56,10 @@ pub struct SourceListItem {
 
 pub async fn list(
     State(state): State<AppState>,
+    role: Role,
     Query(q): Query<SourceQuery>,
 ) -> ApiResult<Json<Page<SourceListItem>>> {
+    require_admin(role)?;
     let page = resolve_page(q.limit, q.offset, &state)?;
     let search = q
         .query
@@ -165,8 +178,10 @@ struct DetailRow {
 
 pub async fn detail(
     State(state): State<AppState>,
+    role: Role,
     Path(id): Path<i64>,
 ) -> ApiResult<Json<SourceDetail>> {
+    require_admin(role)?;
     let row = sqlx::query_as::<_, DetailRow>(
         "SELECT id, doc_id, varak_no, certificate, source_text, raw, created_at, updated_at \
          FROM source_records WHERE id = $1",

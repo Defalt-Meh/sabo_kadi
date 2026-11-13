@@ -10,7 +10,10 @@ Ottoman **kadı (judge) appointment records**. Built with Rust, Axum, Tokio, SQL
   server can serve it on the same origin — see [§5](#5-running-the-api).
 
 See [architecture.md](architecture.md) for the data model, design decisions and
-the list of domain questions that need historians' input.
+the list of domain questions that need historians' input, and
+[docs/KULLANIM_VE_BAKIM.md](docs/KULLANIM_VE_BAKIM.md) (Turkish) for the user
+guide, usage scenarios and the maintenance procedures (adding data, admin
+password, hosting limits).
 
 ---
 
@@ -160,16 +163,52 @@ falls back to `http://127.0.0.1:8080/api/v1` (that needs
 | --- | --- |
 | `GET /api/v1/health` | liveness + DB reachability |
 | `GET /api/v1/meta` | corpus counts, `year_numeric` span, calendars, distinct `degrees` / `position_types` |
-| `GET /api/v1/persons` | list/search persons (`query`, `resolution_status`, `has_wikidata`, `limit`, `offset`) |
+| `GET /api/v1/session` | `{ role: "admin" \| "user", login_enabled }` — see *Admin view* below |
+| `GET /api/v1/persons` | list/search persons (`query`, `match` = `contains` (default) \| `prefix`, `resolution_status`, `has_wikidata`, `limit`, `offset`); names starting with the text come first, then the most frequent |
 | `GET /api/v1/persons/{id}` | person profile + `journey` in itinerary order (year first, then the old place → new place chain; `sequence`, `follows_previous`, predecessor/successor, coordinates) |
-| `GET /api/v1/places` | list/search places (`query`, `has_coordinates`, `has_wikidata`, `limit`, `offset`) |
+| `GET /api/v1/places` | list/search places (`query`, `match` = `contains` \| `prefix`, `has_coordinates`, `has_wikidata`, `limit`, `offset`) |
 | `GET /api/v1/places/{id}` | place profile: historical names, stats, related persons |
-| `GET /api/v1/appointments` | event list; filters: `person`, `place`, `origin_place`, `destination_place`, `year_from`, `year_to`, `degree`, `position_type`, `region`, `has_coordinates`, `source_record_id`, `limit`, `offset` |
-| `GET /api/v1/place-activity` | geocoded places with `arrivals` / `departures` under the `/flows` filters, for the map's place view; `limit` up to 5000 |
-| `GET /api/v1/flows` | `origin → destination → count` aggregation for a year window; `year_from`, `year_to`, `person`, `min_count`, `require_coordinates` (default `true`), `limit`, `offset` |
+| `GET /api/v1/appointments` | event list under the [shared filters](#shared-filters); `sort` = `year` (default) \| `year_desc` \| `origin` \| `destination` \| `old_kadi` \| `new_kadi` \| `degree` \| `position_type`; `limit`, `offset` |
+| `GET /api/v1/appointments/ids` | `{ ids, total }` of the matching records (the map uses it to highlight the steps of an itinerary that pass the filters) |
+| `GET /api/v1/export/appointments.csv` | every matching record (shared filters + `sort`) as UTF-8 CSV with BOM, including an approximate Gregorian year; never includes source texts |
+| `GET /api/v1/stats` | grouped counts for charts: `by` = `destination` \| `origin` \| `place` \| `new_kadi` \| `old_kadi` \| `person` \| `year` \| `decade` \| `degree` \| `position_type`, `limit` (top-N, default 10); returns `items`, `groups`, `records`, `undated` |
+| `GET /api/v1/stats/summary` | `records`, `mapped` (both places geocoded), `with_origin`, `undated`, distinct `persons` / `places`, year span — for a filter set |
+| `GET /api/v1/place-activity` | geocoded places with `arrivals` / `departures` under the shared filters, for the map's place view; `limit` up to 5000 |
+| `GET /api/v1/flows` | `origin → destination → count` aggregation under the shared filters; `min_count`, `require_coordinates` (default `true`), `limit`, `offset` |
 | `GET /api/v1/gazetteer` | every delivered place → coordinate row with its verdict; `status` (`accepted` / `needs_review` / `rejected`), `issue` (e.g. `outside_study_region`), `query`, `limit`, `offset` |
-| `GET /api/v1/sources` | source records; `query` runs PostgreSQL full-text search over `source_text` and returns highlighted snippets + `rank` |
-| `GET /api/v1/sources/{id}` | one source record including the raw JSON row |
+| `GET /api/v1/sources` | source records; `query` runs PostgreSQL full-text search over `source_text` and returns highlighted snippets + `rank` (admin view only) |
+| `GET /api/v1/sources/{id}` | one source record including the raw JSON row (admin view only) |
+| `GET /admin/login`, `GET /admin/logout` | admin session (browser password dialog → HttpOnly cookie), only when an admin password is configured |
+
+### Shared filters
+
+`/appointments`, `/appointments/ids`, the CSV export, `/flows`,
+`/place-activity`, `/stats` and `/stats/summary` accept the same filters
+(`src/api/filters.rs`), so the map, the table, the charts and the export always
+describe the same records:
+
+| Parameter | Meaning |
+| --- | --- |
+| `year_from`, `year_to` | inclusive `year_numeric` window (a bound also excludes undated records) |
+| `person` / `persons=4,17` | records where any of these persons is the outgoing or the incoming kadı |
+| `place` | records whose old or new place is this place |
+| `place_prefix` | records whose old or new place *starts with* this text (normalized: `Misis` matches `Misis`, `Misis maa Ayaş`, `Misis ma‘a Ayaş-ı Perendi`) |
+| `direction` | with `place` / `place_prefix`: `arrival` (the place is the new place), `departure` (the place is the old place), `any` (default) |
+| `origin_place`, `destination_place`, `source_record_id` | exact links |
+| `degree`, `position_type` | vocabulary values (spelling variants folded) |
+| `region` | substring of the raw region |
+| `has_coordinates` | `true`: both places geocoded; `false`: at least one is not |
+
+### Admin view and user view
+
+With `KADI_ATLAS__ADMIN_PASSWORD` set, visitors get the **user view**: source
+texts and raw rows (`/sources`) answer `403`, the frontend hides the Sources
+tab and the source text in the record panel. An administrator opens
+`/admin/login`, types the password in the browser dialog (any user name) and
+gets an HttpOnly, SameSite=Strict cookie holding an HMAC of the password
+(changing the password logs everyone out). Without the variable every visitor
+gets the admin view; an admin can still preview the user view with the
+*Admin view / User view* button in the header.
 
 Every list response is `{ "items": [...], "total": N, "limit": N, "offset": N }`.
 
@@ -200,6 +239,7 @@ See [`.env.example`](.env.example). Key ones:
 | `RUST_LOG` | `info,...` | tracing filter |
 | `KADI_ATLAS__CORS_ALLOW_ORIGIN` | unset | if set, enables a read-only (GET/HEAD) CORS policy for that one origin; otherwise the API is same-origin only |
 | `KADI_ATLAS__WEB_DIR` | unset | directory with `index.html` (e.g. `web`) to serve at `/`; unknown `/api/*` paths stay JSON 404s |
+| `KADI_ATLAS__ADMIN_PASSWORD` | unset | enables the user view / admin login (min. 8 characters); see *Admin view and user view* |
 
 Security headers set on every response: `Content-Security-Policy: default-src
 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'` (pages
@@ -226,8 +266,11 @@ cargo build --release
 The integration suite (`tests/integration.rs`) covers: health, `400` on invalid
 queries, `404` on missing entities/routes, XLSX import idempotency (raw
 preservation, placeholder → NULL, coordinates → PostGIS, `calendar = unknown`),
-person/place search + profiles, appointment filtering (by person and year), and
-flow aggregation with coordinates.
+person/place search + profiles, appointment filtering (by person and year),
+flow aggregation with coordinates, prefix + direction filters, `/stats`,
+`/stats/summary`, the CSV export, and the user view / admin login. Unit tests
+cover the Hijri ↔ Gregorian conversion (`src/calendar.rs`), the filter SQL, CSV
+quoting and the session cookie.
 
 ## 7. Production build / deploy
 

@@ -33,6 +33,7 @@ pub fn test_config() -> Config {
         log_format: LogFormat::Pretty,
         cors_allow_origin: None,
         web_dir: None,
+        admin_password: None,
     }
 }
 

@@ -20,6 +20,11 @@ pub enum ApiError {
     #[error("{0}")]
     NotFound(String),
 
+    /// The caller's role may not read this resource (e.g. source texts in the
+    /// public user view).
+    #[error("{0}")]
+    Forbidden(String),
+
     /// The database is unreachable / not ready.
     #[error("service unavailable")]
     Unavailable,
@@ -38,10 +43,15 @@ impl ApiError {
         Self::NotFound(msg.into())
     }
 
+    pub fn forbidden(msg: impl Into<String>) -> Self {
+        Self::Forbidden(msg.into())
+    }
+
     fn status(&self) -> StatusCode {
         match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
+            Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -51,6 +61,7 @@ impl ApiError {
         match self {
             Self::BadRequest(_) => "bad_request",
             Self::NotFound(_) => "not_found",
+            Self::Forbidden(_) => "forbidden",
             Self::Unavailable => "service_unavailable",
             Self::Internal(_) => "internal",
         }
@@ -58,7 +69,7 @@ impl ApiError {
 
     fn client_message(&self) -> String {
         match self {
-            Self::BadRequest(m) | Self::NotFound(m) => m.clone(),
+            Self::BadRequest(m) | Self::NotFound(m) | Self::Forbidden(m) => m.clone(),
             Self::Unavailable => "the service is temporarily unavailable".to_string(),
             Self::Internal(_) => "an internal error occurred".to_string(),
         }

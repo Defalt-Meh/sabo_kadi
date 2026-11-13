@@ -97,6 +97,25 @@ async function request(path, { query = null, signal = null, timeout = DEFAULT_TI
 }
 
 
+// The sidebar filters as API query parameters (see src/api/filters.rs).
+function filterQuery(filters = {}) {
+  return {
+    person: filters.person_id,
+    persons: Array.isArray(filters.persons) && filters.persons.length ? filters.persons.join(",") : undefined,
+    place: filters.place_id,
+    place_prefix: filters.place_prefix,
+    direction: filters.direction,
+    origin_place: filters.origin_place_id,
+    destination_place: filters.destination_place_id,
+    source_record_id: filters.source_record_id,
+    year_from: filters.year_from,
+    year_to: filters.year_to,
+    degree: filters.degree,
+    position_type: filters.position_type,
+    has_coordinates: filters.has_coordinates
+  };
+}
+
 export async function getMeta(options = {}) {
   let data;
 
@@ -141,8 +160,17 @@ export async function searchPlaces(query, options = {}) {
   const q = String(query ?? "").trim();
   if (!q) return [];
 
-  const data = await request("/places", { ...options, query: { q, limit: 20 } });
+  const data = await request("/places", { ...options, query: { q, limit: options.limit ?? 20, match: options.match } });
   return items(data).map(normalizePlace);
+}
+
+// How many places start with `query` (the "all places starting with …" option).
+export async function countPlacesWithPrefix(query, options = {}) {
+  const q = String(query ?? "").trim();
+  if (!q) return 0;
+
+  const data = await request("/places", { ...options, query: { q, match: "prefix", limit: 1 } });
+  return Number(data?.total ?? 0);
 }
 
 export async function getPlace(id, options = {}) {
@@ -153,15 +181,8 @@ export async function getAppointments(filters = {}, options = {}) {
   const data = await request("/appointments", {
     ...options,
     query: {
-      person: filters.person_id,
-      place: filters.place_id,
-      origin_place: filters.origin_place_id,
-      destination_place: filters.destination_place_id,
-      source_record_id: filters.source_record_id,
-      year_from: filters.year_from,
-      year_to: filters.year_to,
-      degree: filters.degree,
-      position_type: filters.position_type,
+      ...filterQuery(filters),
+      sort: filters.sort,
       limit: clampLimit(filters.limit, 200),
       offset: filters.offset ?? 0
     }
@@ -170,16 +191,21 @@ export async function getAppointments(filters = {}, options = {}) {
   return page(data, normalizeAppointment);
 }
 
+// Ids of the records matching the filters (to mark steps of a route).
+export async function getAppointmentIds(filters = {}, options = {}) {
+  const data = await request("/appointments/ids", { ...options, query: filterQuery(filters) });
+  return { ids: new Set(data?.ids ?? []), total: Number(data?.total ?? 0) };
+}
+
+export function appointmentsCsvUrl(filters = {}) {
+  return buildUrl("/export/appointments.csv", { ...filterQuery(filters), sort: filters.sort });
+}
+
 export async function getFlows(filters = {}, options = {}) {
   const data = await request("/flows", {
     ...options,
     query: {
-      person: filters.person_id,
-      place: filters.place_id,
-      year_from: filters.year_from,
-      year_to: filters.year_to,
-      degree: filters.degree,
-      position_type: filters.position_type,
+      ...filterQuery(filters),
       require_coordinates: true,
       limit: clampLimit(filters.limit, 200)
     }
@@ -191,15 +217,7 @@ export async function getFlows(filters = {}, options = {}) {
 export async function getPlaceActivity(filters = {}, options = {}) {
   const data = await request("/place-activity", {
     ...options,
-    query: {
-      person: filters.person_id,
-      place: filters.place_id,
-      year_from: filters.year_from,
-      year_to: filters.year_to,
-      degree: filters.degree,
-      position_type: filters.position_type,
-      limit: clampLimit(filters.limit, 5000)
-    }
+    query: { ...filterQuery(filters), limit: clampLimit(filters.limit, 5000) }
   });
 
   return page(data, (place) => ({
@@ -210,6 +228,55 @@ export async function getPlaceActivity(filters = {}, options = {}) {
     arrivals: Number(place.arrivals) || 0,
     departures: Number(place.departures) || 0
   }));
+}
+
+// Grouped counts for charts: by = destination | origin | place | new_kadi |
+// old_kadi | person | year | decade | degree | position_type.
+export async function getStats(by, filters = {}, options = {}) {
+  const data = await request("/stats", {
+    ...options,
+    query: { ...filterQuery(filters), by, limit: filters.limit }
+  });
+
+  return {
+    by,
+    items: (data?.items ?? []).map((item) => ({
+      id: item.id ?? null,
+      label: item.label ?? null,
+      value: numberOrNull(item.value),
+      count: Number(item.count) || 0
+    })),
+    groups: Number(data?.groups ?? 0),
+    records: Number(data?.records ?? 0),
+    undated: Number(data?.undated ?? 0)
+  };
+}
+
+export async function getSummary(filters = {}, options = {}) {
+  const data = await request("/stats/summary", { ...options, query: filterQuery(filters) });
+
+  return {
+    records: Number(data?.records ?? 0),
+    mapped: Number(data?.mapped ?? 0),
+    with_origin: Number(data?.with_origin ?? 0),
+    undated: Number(data?.undated ?? 0),
+    persons: Number(data?.persons ?? 0),
+    places: Number(data?.places ?? 0),
+    year_min: numberOrNull(data?.year_min),
+    year_max: numberOrNull(data?.year_max)
+  };
+}
+
+// { role: "admin" | "user", login_enabled }. An older server without the
+// endpoint serves everything, i.e. behaves like the admin view.
+export async function getSession(options = {}) {
+  try {
+    const data = await request("/session", options);
+    return { role: data?.role === "user" ? "user" : "admin", login_enabled: Boolean(data?.login_enabled) };
+  } catch (error) {
+    if (error.status === 404) return { role: "admin", login_enabled: false };
+    throw error;
+  }
 }
 
 export async function searchSources({ q = "", limit = 30, offset = 0 } = {}, options = {}) {
